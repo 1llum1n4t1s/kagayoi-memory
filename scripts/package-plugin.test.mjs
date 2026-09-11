@@ -34,11 +34,13 @@ test("buildPackage creates a clean, valid consumer package", async () => {
     for (const required of [
       ".codex-plugin/plugin.json",
       ".mcp.json",
+      "CHANGELOG.md",
       "client/mcp-server.mjs",
       "hooks/hooks.json",
       "scripts/setup-client.ps1",
       "scripts/setup-server.mjs",
       "scripts/setup-server.ps1",
+      "scripts/setup-topics.mjs",
       "server/pnpm-lock.yaml",
       "server/wrangler.example.jsonc",
       "server/migrations/0001_initial.sql",

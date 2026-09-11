@@ -24,7 +24,7 @@ const REQUIRED_FILES = new Set([
   "server/wrangler.example.jsonc",
 ]);
 
-const OPTIONAL_FILES = new Set(["LICENSE", "LICENSE.md"]);
+const OPTIONAL_FILES = new Set(["CHANGELOG.md", "LICENSE", "LICENSE.md"]);
 const DIRECTORY_RULES = [
   { prefix: "client/", extension: /\.(?:js|mjs)$/u },
   { prefix: "server/migrations/", extension: /\.sql$/u },
