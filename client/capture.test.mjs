@@ -141,7 +141,8 @@ test("assistant回答を索引上の確認済み事実へ昇格しない", () =>
   assert.equal(document.metadata.sm_project_id, "repo_project");
   assert.equal(document.metadata.memoryIndex.description, "保存内容を整理して");
   assert.doesNotMatch(JSON.stringify(document.metadata.memoryIndex), /確認済み|verified|evidence/i);
-  assert.match(document.content, /接続は確認済みです。/);
+  assert.equal(document.content, "# 記憶の整理\n\n### User request\n保存内容を整理して\n\n### Final assistant response\n接続は確認済みです。");
+  assert.doesNotMatch(document.content, /^Session:|\nSession:|^Turn:|\nTurn:|^Part:|\nPart:/m);
 });
 
 test("明示した保存containerもproject provenanceと決定的IDを変えない", () => {
@@ -188,7 +189,7 @@ test("履歴importは全space一覧から旧containerの同じcaptureKeyを検�
   writeFileSync(join(f.home, "supermemory.json"), JSON.stringify({ baseUrl, apiKey: "history-test-key" }));
   const result = await runHistoryImport(["--codex-home", f.home, "--include-recent", "--session-id", "task-a"]);
   assert.equal(result.code, 0, result.stderr);
-  assert.deepEqual(listBodies, [{ page: 1, limit: 50 }]);
+  assert.deepEqual(listBodies, [{ page: 1, limit: 50, projection: "capture" }]);
   const report = JSON.parse(result.stdout);
   assert.deepEqual(report.containerTags, ["memories"]);
   assert.equal(report.plannedDocuments, 1);
@@ -320,7 +321,7 @@ test("自動保存と復元は同じIDを使い、分割しても本文を欠落
   assert.ok(docs.length > 1);
   assert.ok(docs.every((doc) => doc.content.length <= 10000));
   assert.deepEqual(docs, buildTurnDocuments({ meta: f.meta }, transcript, getProjectContext(f.home), "タイトル", 10000));
-  const body = docs.map((doc) => doc.content.slice(doc.content.indexOf("\n\n", doc.content.indexOf("Part:")) + 2)).join("");
+  const body = docs.map((doc) => doc.content.slice(doc.content.indexOf("\n\n") + 2)).join("");
   assert.equal(body, `### User request\n依頼\n\n### Final assistant response\n${"長い結果".repeat(4000)}`);
   const largerParts = buildTurnDocuments({ meta: f.meta }, transcript, getProjectContext(f.home), "タイトル", 12000);
   assert.notEqual(docs[0].customId, largerParts[0].customId);

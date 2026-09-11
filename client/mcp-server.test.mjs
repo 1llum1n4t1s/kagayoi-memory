@@ -104,6 +104,25 @@ test("forgetの既定対象は共通containerだけで、旧project空間へ拡�
   assert.ok(calls.every(([path, options]) => path === "/v4/memories" && options.method === "DELETE"));
 });
 
+test("forgetはgetDocumentで得たIDをcontainerと共に送る", async () => {
+  let requestBody;
+  const result = await callTool("add_memory", {
+    action: "forget",
+    documentId: "codex-turn-v2:0123456789abcdef",
+    containerTag: "legacy-project",
+  }, { request: async (path, options) => {
+    assert.equal(path, "/v4/memories");
+    assert.equal(options.method, "DELETE");
+    requestBody = options.body;
+    return { id: "codex-turn-v2:0123456789abcdef", message: "Memory forgotten" };
+  } });
+  assert.deepEqual(requestBody, {
+    containerTag: "legacy-project",
+    documentId: "codex-turn-v2:0123456789abcdef",
+  });
+  assert.equal(result.structuredContent.id, "codex-turn-v2:0123456789abcdef");
+});
+
 test("listTopicsは全空間のtopic件数と未分類件数をページ付きで返す", async () => {
   const result = await callTool("listTopics", { page: 2, limit: 40 }, { request: async (path) => {
     assert.equal(path, "/v4/topics?page=2&limit=40");

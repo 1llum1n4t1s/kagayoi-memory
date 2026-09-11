@@ -12,7 +12,13 @@ test("classification plan reads all-space unclassified indexes without enqueuein
   assert.equal(result.selected, 1);
   assert.deepEqual(result.accepted, []);
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls[1][1].body, { topic: "__unclassified__", page: 1, limit: 10 });
+  assert.deepEqual(calls[1][1].body, {
+    topic: "__unclassified__",
+    page: 1,
+    limit: 10,
+    projection: "ids",
+    enrichmentEligible: true,
+  });
 });
 
 test("apply uses a finite snapshot and reports partial enqueue failures", async () => {

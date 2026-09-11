@@ -19,7 +19,7 @@ export function parseOptions(args) {
 export async function setupTopics({ apply = false, limit = 10 } = {}, request = api) {
   const overview = await request("/v4/topics");
   const page = await request("/v3/documents/list", {
-    body: { topic: "__unclassified__", page: 1, limit },
+    body: { topic: "__unclassified__", page: 1, limit, projection: "ids", enrichmentEligible: true },
   });
   const ids = [...new Set((page.documents || []).map((document) => document.id))];
   if (ids.length > limit || ids.some((id) => typeof id !== "string" || !id.trim())) {

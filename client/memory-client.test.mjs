@@ -55,24 +55,47 @@ test("SessionStartは話題がないため保存先一覧も最近の文書も�
   assert.deepEqual(hook, {});
 });
 
+test("指示語だけの依頼は検索APIを呼ばない", async () => {
+  assert.deepEqual(queryTerms("この その あの どの ここ そこ this that"), []);
+  const calls = [];
+  const hook = await runHook("UserPromptSubmit", { prompt: "この その あの どの ここ そこ this that" }, {
+    settings,
+    context,
+    request: async (...args) => { calls.push(args); throw new Error("unexpected request"); },
+  });
+  assert.deepEqual(calls, []);
+  assert.deepEqual(hook, {});
+});
+
 test("明示した保存先での検索はその一つだけに限定する", async () => {
   const calls = [];
   const result = await searchIndex({ query: "Kiriha", containerTag: "chosen", settings, context,
-    request: async (_path, { body }) => { calls.push(body.containerTag); return { results: [row("chosen-id", "chosen")] }; } });
-  assert.deepEqual(calls, ["chosen"]);
+    request: async (_path, { body }) => { calls.push(body); return { results: [row("chosen-id", "chosen")] }; } });
+  assert.deepEqual(calls, [{ containerTag: "chosen", q: "Kiriha", limit: 20 }]);
   assert.equal(result.results[0].containerTag, "chosen");
+
+  calls.length = 0;
+  await searchIndex({ query: "Kiriha", containerTag: "chosen", settings, context, automatic: true,
+    request: async (_path, { body }) => { calls.push(body); return { results: [row("chosen-id", "chosen")] }; } });
+  assert.deepEqual(calls, [{ containerTag: "chosen", q: "Kiriha", limit: 20, indexOnly: true }]);
 });
 
-test("低スコア候補と高スコアでも拡張だけが一致する別話題を自動注入しない", async () => {
+test("低スコア候補とsemanticだけが一致する別話題を自動注入せず、手動検索には残す", async () => {
   assert.deepEqual(queryTerms("Chrome拡張機能を実装して"), ["chrome", "拡張機能"]);
   const request = withDiscovery(async (_path, { body }) => ({ results: [row("unrelated", body.containerTag, { similarity: 0.61 })] }));
   const hook = await runHook("UserPromptSubmit", { prompt: "Supermemoryの接続経路を確認" }, { settings, context, request });
   assert.deepEqual(hook, {});
   const sharedOnly = { ...context, projectTags: [], readTags: ["shared"] };
+  const semanticRequest = withDiscovery(async () => ({ results: [row("unrelated", "shared", {
+    similarity: 0.99,
+    semanticSimilarity: 0.99,
+    metadata: { memoryIndex: buildMemoryIndex({ title: "ファイルドロップ対応を拡張", request: "ドロップ対象を増やす" }) },
+  })] }), ["shared"]);
   const semanticOnly = await runHook("UserPromptSubmit", { prompt: "Supermemoryの接続経路" }, { settings, context: sharedOnly,
-    request: withDiscovery(async () => ({ results: [row("unrelated", "shared", { similarity: 0.99,
-      metadata: { memoryIndex: buildMemoryIndex({ title: "ファイルドロップ対応を拡張", request: "ドロップ対象を増やす" }) } })] }), ["shared"]) });
+    request: semanticRequest });
   assert.deepEqual(semanticOnly, {});
+  const manual = await searchIndex({ query: "Supermemoryの接続経路", settings, context: sharedOnly, request: semanticRequest });
+  assert.deepEqual(manual.results.map(({ id }) => id), ["unrelated"]);
 });
 
 test("分類済みtopicに検索語が一致する索引はタイトルが別でも自動注入する", async () => {
@@ -136,7 +159,91 @@ test("保存文書の索引からgetDocumentで欠落なく同じ原文に戻れ
   assert.equal(detail.document.content, saved.content);
   assert.match(detail.text, /検証結果は未確定/);
   assert.equal(detail.document.index.containerTag, "memories");
-  assert.deepEqual(detail.document.index.provenance, { containerTag: "memories", projectId: "project", project: "Kiriha", filepath: undefined });
+  assert.deepEqual(detail.document.provenance, { containerTag: "memories", projectId: "project", project: "Kiriha", filepath: undefined });
+  assert.equal(detail.document.index.provenance, undefined);
+});
+
+test("旧v2の生成prefixだけを読取り時に除き、公開詳細から内部metadataを除外する", async () => {
+  const originalContent = "# 旧v2\n\nSession: session-1\nTurn: 2\n\nPart: 1/2\n\n### User request\n# 利用者の見出し\nSession: keep-me\nTurn: 99\nPart: 9/9\n\n本文";
+  const document = {
+    id: "legacy-v2",
+    content: originalContent,
+    summary: "PRIVATE_SUMMARY",
+    containerTags: ["memories"],
+    createdAt: date,
+    updatedAt: date,
+    topics: ["移行"],
+    provenance: { containerTag: "memories", projectId: "repo-project" },
+    metadata: {
+      captureVersion: 2,
+      captureKey: "PRIVATE_CAPTURE_KEY",
+      title: "旧v2",
+      sessionId: "session-1",
+      turn: 2,
+      part: 1,
+      parts: 2,
+      memoryIndex: buildMemoryIndex({ title: "旧v2", request: "移行を確認する", sourceUpdatedAt: date }),
+    },
+    enrichment: {
+      embeddingStatus: "done",
+      factStatus: "failed",
+      vectorStatus: "indexed",
+      topicStatus: "done",
+      embeddingModel: "PRIVATE_MODEL",
+      factModel: "PRIVATE_FACT_MODEL",
+      topicModel: "PRIVATE_TOPIC_MODEL",
+      embeddedAt: date,
+      factsExtractedAt: date,
+      topicsExtractedAt: date,
+      vectorAttemptedAt: date,
+      error: "fact extraction failed",
+      internalState: "PRIVATE_STATE",
+    },
+  };
+  const result = await callTool("getDocument", { documentId: document.id }, { request: async () => document });
+  const expectedContent = "# 旧v2\n\n### User request\n# 利用者の見出し\nSession: keep-me\nTurn: 99\nPart: 9/9\n\n本文";
+  assert.equal(result.structuredContent.document.content, expectedContent);
+  assert.match(result.content[0].text, /これは過去の記録です。現在の状態と照合して利用してください。/);
+  assert.doesNotMatch(result.content[0].text, /Imported source paths|Session: session-1|Turn: 2|Part: 1\/2/);
+  assert.match(result.content[0].text, /Session: keep-me\nTurn: 99\nPart: 9\/9/);
+  assert.deepEqual(result.structuredContent.document.index.part, 1);
+  assert.deepEqual(result.structuredContent.document.index.parts, 2);
+  assert.deepEqual(result.structuredContent.document.enrichment, {
+    embeddingStatus: "done",
+    factStatus: "failed",
+    vectorStatus: "indexed",
+    topicStatus: "done",
+    error: "fact extraction failed",
+    embeddedAt: date,
+    factsExtractedAt: date,
+    topicsExtractedAt: date,
+    vectorAttemptedAt: date,
+  });
+  const publicResult = JSON.stringify(result);
+  assert.doesNotMatch(publicResult, /PRIVATE_CAPTURE_KEY|PRIVATE_SUMMARY|PRIVATE_MODEL|PRIVATE_FACT_MODEL|PRIVATE_TOPIC_MODEL|PRIVATE_STATE/);
+  assert.doesNotMatch(publicResult, /captureKey|sessionId|"turn"|evidence|metadata/);
+});
+
+test("新形式と一致しないv2本文の利用者markdownは変更しない", async () => {
+  const content = "# 新形式\n\n### User request\nSession: user-session\nTurn: 7\nPart: 1/3\n本文";
+  const result = await readDocument("new-v2", async () => ({
+    id: "new-v2",
+    content,
+    metadata: { captureVersion: 2, title: "新形式", sessionId: "session-1", turn: 2, part: 1, parts: 2 },
+  }));
+  assert.equal(result.document.content, content);
+  assert.match(result.text, /Session: user-session\nTurn: 7\nPart: 1\/3/);
+});
+
+test("旧v2のPart行がmetadataと一致しない本文はprefixを部分削除しない", async () => {
+  const content = "# 旧v2\n\nSession: session-1\nTurn: 2\n\nPart: 2/2\n\n本文";
+  const result = await readDocument("mismatched-v2", async () => ({
+    id: "mismatched-v2",
+    content,
+    metadata: { captureVersion: 2, title: "旧v2", sessionId: "session-1", turn: 2, part: 1, parts: 2 },
+  }));
+  assert.equal(result.document.content, content);
+  assert.match(result.text, /Session: session-1\nTurn: 2\n\nPart: 2\/2/);
 });
 
 test("旧文書も本文を索引から分離し、新しい保存日時を原文の日時と誤表示しない", () => {
@@ -178,6 +285,8 @@ test("MCPツールはスキーマ外の値をAPIへ送信しない", async () =>
     ["search_memory", { query: "topic", containerTag: " " }],
     ["add_memory", { content: "value", action: "remove" }],
     ["add_memory", { content: "" }],
+    ["add_memory", { action: "forget" }],
+    ["add_memory", { content: "value", documentId: "unexpected" }],
     ["listDocuments", { page: 0 }],
     ["listMemories", { limit: 51 }],
     ["listDocuments", { topic: " " }],
@@ -190,11 +299,26 @@ test("MCPツールはスキーマ外の値をAPIへ送信しない", async () =>
   assert.equal(calls, 0);
 });
 
-test("一覧は全文を返さず詳細IDを返す", async () => {
+test("一覧は公開indexのJSON配列と既存structured schemaだけを返す", async () => {
   for (const name of ["listDocuments", "listMemories"]) {
-    const result = await callTool(name, {}, { settings, context, request: async () => ({ documents: [row()], pagination: { currentPage: 1 } }) });
+    const source = row("doc-1", "shared", { metadata: {
+      ...row().metadata,
+      captureKey: "PRIVATE_CAPTURE_KEY",
+      sessionId: "session-1",
+      turn: 4,
+      part: 1,
+      parts: 2,
+    } });
+    const result = await callTool(name, {}, { settings, context, request: async () => ({ documents: [source], pagination: { currentPage: 1 } }) });
+    const key = name === "listMemories" ? "memoryEntries" : "documents";
     assert.doesNotMatch(JSON.stringify(result), /DETAIL_ONLY/);
-    assert.match(JSON.stringify(result), /doc-1/);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_CAPTURE_KEY|captureKey|sessionId|"turn"|evidence|provenance|metadata/);
+    assert.equal(result.content[0].text, JSON.stringify(result.structuredContent[key]));
+    assert.deepEqual(Object.keys(result.structuredContent).sort(), [key, "pagination", "containerTag", "topic", "listScope"].sort());
+    assert.deepEqual(Object.keys(result.structuredContent[key][0]).sort(), [
+      "id", "title", "description", "containerTag", "topics", "sections", "sourceUpdatedAt",
+      "updatedAt", "createdAt", "recallable", "part", "parts",
+    ].sort());
   }
 });
 
@@ -211,18 +335,13 @@ test("文書一覧は既定で全spaceを横断し、topicと物理containerを�
   const all = await listIndex({ topic: "Cloudflare D1", request });
   const limited = await listIndex({ containerTag: "memories", topic: "__unclassified__", page: 2, limit: 5, request });
   assert.deepEqual(calls, [
-    ["/v3/documents/list", { page: 1, limit: 10, topic: "Cloudflare D1" }],
-    ["/v3/documents/list", { page: 2, limit: 5, containerTag: "memories", topic: "__unclassified__" }],
+    ["/v3/documents/list", { page: 1, limit: 10, projection: "index", topic: "Cloudflare D1" }],
+    ["/v3/documents/list", { page: 2, limit: 5, projection: "index", containerTag: "memories", topic: "__unclassified__" }],
   ]);
   assert.equal(all.listScope, "all-containers");
   assert.equal(all.containerTag, null);
   assert.deepEqual(all.documents[0].topics, ["Cloudflare D1"]);
-  assert.deepEqual(all.documents[0].provenance, {
-    containerTag: "legacy-space",
-    projectId: "repo_memory_service__1234",
-    project: "memory-service",
-    filepath: undefined,
-  });
+  assert.equal(all.documents[0].provenance, undefined);
   assert.equal(limited.listScope, "explicit-container");
 });
 
@@ -250,6 +369,162 @@ test("旧文書の抜粋に別話題が混じっていても原文の該当見�
   assert.equal(result.results[0].description, "ブックマークの選択解除");
   assert.equal(result.results[0].sourceUpdatedAt, "2026-09-09T02:11:00+00:00");
   assert.doesNotMatch(JSON.stringify(result.results), /課金|DETAIL_ONLY/);
+});
+
+test("indexOnlyの旧文書は低い互換スコアでもhydrate後の関連度で採用する", async () => {
+  const entry = {
+    id: "legacy-low-score",
+    containerTag: "legacy",
+    createdAt: date,
+    updatedAt: date,
+    similarity: 0.61,
+    score: 0.61,
+    metadata: {},
+  };
+  const original = {
+    ...entry,
+    content: "# Kirihaの選択解除\n\n### User request\nKirihaの選択解除を調べて\n\n### Final assistant response\nDETAIL_ONLY",
+  };
+  const hydrated = [];
+  const result = await searchIndex({
+    query: "Kirihaの選択解除",
+    containerTag: "legacy",
+    settings,
+    context,
+    request: async (path) => {
+      if (path === "/v4/search") return { results: [entry] };
+      hydrated.push(path);
+      return original;
+    },
+  });
+  assert.deepEqual(hydrated, ["/v3/documents/legacy-low-score"]);
+  assert.equal(result.results[0].id, "legacy-low-score");
+  assert.equal(result.results[0].title, "Kirihaの選択解除");
+});
+
+test("自動検索はv1本文だけのlexical一致とsemanticだけが近い別話題を除外する", async () => {
+  const bodyOnly = row("body-only", "shared", {
+    similarity: 0.98,
+    lexicalSimilarity: 0,
+    semanticSimilarity: null,
+    metadata: { memoryIndex: buildMemoryIndex({ title: "無関係な保存記録", request: "別件を記録する" }) },
+  });
+  const indexMatch = row("index-match", "shared", {
+    similarity: 0.51,
+    lexicalSimilarity: 0.51,
+    semanticSimilarity: null,
+    metadata: { memoryIndex: buildMemoryIndex({ title: "TargetNeedle の索引", request: "対象を調べる" }) },
+  });
+  const semanticMatch = row("semantic-match", "shared", {
+    similarity: 0.82,
+    semanticSimilarity: 0.82,
+    metadata: { memoryIndex: buildMemoryIndex({ title: "意味だけが近い記録", request: "別の表現を保存する" }) },
+  });
+  const result = await searchIndex({
+    query: "TargetNeedle",
+    containerTag: "shared",
+    settings,
+    context,
+    automatic: true,
+    request: async () => ({ results: [bodyOnly, indexMatch, semanticMatch] }),
+  });
+  assert.deepEqual(result.results.map(({ id }) => id), [indexMatch.id]);
+});
+
+test("手動検索はminimumSimilarity未満の本文lexical一致とsemantic-only候補を残す", async () => {
+  const bodyOnly = row("body-only", "shared", {
+    similarity: 0,
+    lexicalSimilarity: 0,
+    semanticSimilarity: null,
+    metadata: { memoryIndex: buildMemoryIndex({ title: "無関係な保存記録", request: "別件を記録する" }) },
+  });
+  const semanticOnly = row("semantic-only", "shared", {
+    similarity: 0.82,
+    lexicalSimilarity: null,
+    semanticSimilarity: 0.82,
+    metadata: { memoryIndex: buildMemoryIndex({ title: "意味だけが近い記録", request: "別の表現を保存する" }) },
+  });
+  const result = await searchIndex({
+    query: "TargetNeedle",
+    containerTag: "shared",
+    settings,
+    context,
+    request: async (_path, { body }) => {
+      assert.equal("indexOnly" in body, false);
+      return { results: [bodyOnly, semanticOnly] };
+    },
+  });
+  assert.deepEqual(result.results.map(({ id }) => id), [semanticOnly.id, bodyOnly.id]);
+});
+
+test("旧文書もhydrate後は索引関連性または実semanticでだけ採用する", async () => {
+  const lexicalOnly = { ...row("legacy-lexical", "legacy"), metadata: {}, similarity: 0.99, semanticSimilarity: null };
+  const semantic = { ...row("legacy-semantic", "legacy"), metadata: {}, similarity: 0.81, semanticSimilarity: 0.81 };
+  const documents = new Map([
+    [lexicalOnly.id, { ...lexicalOnly, content: "# 無関係な旧記録\n別件の詳細" }],
+    [semantic.id, { ...semantic, content: "# 意味検索で見つかった旧記録\n別表現の詳細" }],
+  ]);
+  const hydrated = [];
+  const result = await searchIndex({
+    query: "TargetNeedle",
+    containerTag: "legacy",
+    settings,
+    context,
+    request: async (path) => {
+      if (path === "/v4/search") return { results: [lexicalOnly, semantic] };
+      const id = decodeURIComponent(path.split("/").at(-1));
+      hydrated.push(id);
+      return documents.get(id);
+    },
+  });
+  assert.deepEqual(new Set(hydrated), new Set([lexicalOnly.id, semantic.id]));
+  assert.deepEqual(result.results.map(({ id }) => id), [semantic.id]);
+});
+
+test("3 space各20件の末尾にあるlegacy候補をsummaryでhydrate上限前へ順位付けする", async () => {
+  const tags = ["legacy-a", "legacy-b", "legacy-c"];
+  const byTag = new Map();
+  const originals = new Map();
+  for (const tag of tags) {
+    const rows = Array.from({ length: 20 }, (_, index) => {
+      const id = `${tag}-${index}`;
+      const target = tag === "legacy-c" && index === 19;
+      const summary = target
+        ? "# 後方の対象\nTargetNeedle を含む旧文書の要点"
+        : `# 無関係な記録\narchive ${tag} ${index}`;
+      const entry = { id, containerTag: tag, createdAt: date, updatedAt: date,
+        similarity: 0.61, score: 0.61, metadata: {}, summary };
+      originals.set(id, { ...entry, content: `${summary}\nDETAIL_ONLY` });
+      return entry;
+    });
+    byTag.set(tag, rows);
+  }
+  const hydrated = [];
+  const result = await searchIndex({
+    query: "TargetNeedle",
+    settings,
+    context,
+    request: withDiscovery(async (path, { body } = {}) => {
+      if (path === "/v4/search") return { results: byTag.get(body.containerTag) };
+      const id = decodeURIComponent(path.split("/").at(-1));
+      hydrated.push(id);
+      return originals.get(id);
+    }, tags),
+  });
+  assert.equal(hydrated.length, 40);
+  assert.ok(hydrated.includes("legacy-c-19"));
+  assert.equal(result.results[0].id, "legacy-c-19");
+});
+
+test("一覧の旧文書はcompact summaryから索引を作る", () => {
+  const index = documentIndex({
+    id: "legacy-summary",
+    containerTags: ["legacy"],
+    summary: "# 旧文書\n一覧だけで確認できる要点",
+    metadata: {},
+  });
+  assert.equal(index.title, "旧文書");
+  assert.equal(index.description, "一覧だけで確認できる要点");
 });
 
 test("短い継続依頼でも実質的な結果がある文書は索引に残す", () => {

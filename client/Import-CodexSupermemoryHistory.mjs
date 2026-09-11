@@ -424,14 +424,14 @@ function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars
     const body = `### User request\n${turn.user}\n\n### Final assistant response\n${turn.assistant}`;
     // 本文ハッシュをIDに含め、再送は同じID、別内容は別IDにする。
     const identity = `${candidate.meta.id}:${index + 1}:${sha256(body)}`;
-    const header = `# ${safeTitle}\n\nSession: ${candidate.meta.id}\nTurn: ${index + 1}\n\n`;
-    const size = maxChars - header.length - 80;
+    const legacyHeader = `# ${safeTitle}\n\nSession: ${candidate.meta.id}\nTurn: ${index + 1}\n\n`;
+    const size = maxChars - legacyHeader.length - 80;
     if (size < 100) fail("Document size limit is too small.");
     const parts = [];
     for (let offset = 0; offset < body.length; offset += size) parts.push(body.slice(offset, offset + size));
     return parts.map((part, partIndex) => ({
       customId: `codex-turn-v2:${identity}:${partIndex + 1}:${sha256(part).slice(0, 16)}`,
-      content: `${header}Part: ${partIndex + 1}/${parts.length}\n\n${part}`,
+      content: `# ${safeTitle}\n\n${part}`,
       containerTag,
       ...(reuseExistingCapture ? { reuseExistingCapture: true } : {}),
       metadata: {
@@ -502,7 +502,7 @@ async function listDocuments(config, containerTag) {
   while (true) {
     const result = await api(config, "/v3/documents/list", {
       method: "POST",
-      body: { ...(containerTag ? { containerTag } : {}), page, limit: DEFAULT_LIST_LIMIT },
+      body: { ...(containerTag ? { containerTag } : {}), page, limit: DEFAULT_LIST_LIMIT, projection: "capture" },
     });
     const batch = Array.isArray(result?.documents) ? result.documents : [];
     documents.push(...batch);

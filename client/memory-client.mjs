@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { getProjectContext, loadConfig } from "./Import-CodexSupermemoryHistory.mjs";
-import { documentIndex, formatIndexItem } from "./memory-index.mjs";
+import { documentIndex, formatIndexItem, publicIndex } from "./memory-index.mjs";
 
 const hash = (text) => createHash("sha256").update(text).digest("hex").slice(0, 16);
 const unique = (values) => [...new Set(values.filter((v) => typeof v === "string" && v.trim()).map((v) => v.trim()))];
@@ -63,7 +63,7 @@ export async function api(path, { body, method = body ? "POST" : "GET", timeoutM
   return response.status === 204 ? null : response.json();
 }
 
-const STOP_WORDS = new Set(["memory", "memories", "codex", "情報", "こと", "もの", "これ", "それ", "ため", "よう", "です", "ます", "ください", "する", "した", "して", "れる", "ある", "いる", "確認", "対応", "作業", "実装", "調査"]);
+const STOP_WORDS = new Set(["memory", "memories", "codex", "情報", "こと", "もの", "これ", "それ", "この", "その", "あの", "どの", "ここ", "そこ", "this", "that", "ため", "よう", "です", "ます", "ください", "する", "した", "して", "れる", "ある", "いる", "確認", "対応", "作業", "実装", "調査"]);
 const SEARCH_CONCURRENCY = 8;
 export function queryTerms(query) {
   const segmenter = new Intl.Segmenter("ja", { granularity: "word" });
@@ -90,6 +90,15 @@ function topicRelevance(index, terms) {
   const matches = terms.filter((term) => topic.includes(term));
   if (!matches.length) return 0;
   return matches.reduce((total, term) => total + Math.min(12, term.length), 0) / terms.reduce((total, term) => total + Math.min(12, term.length), 0);
+}
+
+function semanticEligible(row, minimumSimilarity) {
+  return typeof row.semanticSimilarity === "number" &&
+    Number.isFinite(row.semanticSimilarity) && row.semanticSimilarity >= minimumSimilarity;
+}
+
+function lexicalEligible(row) {
+  return typeof row.lexicalSimilarity === "number" && Number.isFinite(row.lexicalSimilarity);
 }
 
 export async function discoverSearchContainers(request = api) {
@@ -127,7 +136,9 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
   const discovery = containerTag ? { tags: [containerTag], complete: true, returnedCount: 1 } : await discoverSearchContainers(request);
   const tags = discovery.tags;
   const results = await mapConcurrent(tags, SEARCH_CONCURRENCY, async (tag) => {
-    const response = await request("/v4/search", { body: { containerTag: tag, q: query, limit: 20 } });
+    const response = await request("/v4/search", {
+      body: { containerTag: tag, q: query, limit: 20, ...(automatic ? { indexOnly: true } : {}) },
+    });
     if (!Array.isArray(response?.results)) throw new Error("Invalid memory search response");
     return response.results.map((row, rank) => ({ row, rank, index: documentIndex(row, tag) }));
   });
@@ -136,12 +147,13 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
   const terms = queryTerms(query);
   const rawCandidates = results.flatMap((r) => r.status === "fulfilled" ? r.value : []).filter(({ row, index }) => {
     if (!index.id || !index.containerTag) return false;
-    // 互換APIは一致しない候補にも0.61を付ける。最低値だけの候補は索引へ入れない。
+    // indexOnly応答では旧文書の本文が無いため、関連度は詳細取得後に判定する。
+    if (row.metadata?.memoryIndex?.version !== 1) return true;
     const relevance = topicRelevance(index, terms);
-    return Number(row.similarity || row.score || 0) >= settings.minimumSimilarity || relevance > 0;
+    return semanticEligible(row, settings.minimumSimilarity) || lexicalEligible(row) || relevance > 0;
   });
   rawCandidates.sort((a, b) => topicRelevance(b.index, terms) - topicRelevance(a.index, terms) ||
-    Number(b.row.similarity || b.row.score || 0) - Number(a.row.similarity || a.row.score || 0) || a.rank - b.rank);
+    Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank);
   const hydrateLimit = Math.min(80, Math.max(20, Number(limit) * 8));
   const distinct = [...new Map(rawCandidates.map((c) => [`${c.index.containerTag}:${c.index.id}`, c])).values()].slice(0, hydrateLimit);
   const failedDocuments = [];
@@ -158,10 +170,13 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
     }
   });
   const hydrated = hydratedResults.filter((result) => result.status === "fulfilled").map((result) => result.value);
-  const candidates = hydrated.filter(({ index }) => !automatic || index.recallable && topicRelevance(index, terms) > 0);
+  const eligible = hydrated.filter(({ row, index }) =>
+    semanticEligible(row, settings.minimumSimilarity) || lexicalEligible(row) || topicRelevance(index, terms) > 0);
+  const candidates = eligible.filter(({ index }) =>
+    !automatic || index.recallable && topicRelevance(index, terms) > 0);
   candidates.sort((a, b) => {
     const topicDifference = topicRelevance(b.index, terms) - topicRelevance(a.index, terms);
-    return topicDifference || Number(b.row.similarity || b.row.score || 0) - Number(a.row.similarity || a.row.score || 0) || a.rank - b.rank ||
+    return topicDifference || Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank ||
       String(b.index.sourceUpdatedAt || b.index.updatedAt || "").localeCompare(String(a.index.sourceUpdatedAt || a.index.updatedAt || ""));
   });
   const documents = [];
@@ -195,16 +210,43 @@ export function formatSearchResult(result) {
 }
 
 export async function listIndex({ containerTag, topic, page = 1, limit = 10, request = api } = {}) {
-  const body = { page, limit, ...(containerTag ? { containerTag } : {}), ...(topic ? { topic } : {}) };
+  const body = { page, limit, projection: "index", ...(containerTag ? { containerTag } : {}), ...(topic ? { topic } : {}) };
   const result = await request("/v3/documents/list", { body });
   if (!Array.isArray(result?.documents)) throw new Error("Invalid memory document-list response");
   return {
-    documents: result.documents.map((document) => documentIndex(document, containerTag)),
+    documents: result.documents.map((document) => publicIndex(documentIndex(document, containerTag))),
     pagination: result.pagination,
     containerTag: containerTag || null,
     topic: topic || null,
     listScope: containerTag ? "explicit-container" : "all-containers",
   };
+}
+
+function sanitizedDocumentContent(document) {
+  const content = String(document.content || document.summary || "");
+  const metadata = document.metadata && typeof document.metadata === "object" ? document.metadata : {};
+  if (metadata.captureVersion !== 2 || typeof metadata.title !== "string" ||
+      typeof metadata.sessionId !== "string" || !Number.isInteger(metadata.turn)) return content;
+  const title = `# ${metadata.title}`;
+  const prefix = `${title}\n\nSession: ${metadata.sessionId}\nTurn: ${metadata.turn}\n\n`;
+  if (!content.startsWith(prefix)) return content;
+  const hasPartMetadata = metadata.part !== undefined || metadata.parts !== undefined;
+  if (hasPartMetadata) {
+    if (!Number.isInteger(metadata.part) || !Number.isInteger(metadata.parts)) return content;
+    const fullPrefix = `${prefix}Part: ${metadata.part}/${metadata.parts}\n\n`;
+    if (!content.startsWith(fullPrefix)) return content;
+    return `${title}\n\n${content.slice(fullPrefix.length)}`;
+  }
+  return `${title}\n\n${content.slice(prefix.length)}`;
+}
+
+function publicEnrichment(enrichment) {
+  if (!enrichment || typeof enrichment !== "object") return undefined;
+  const keys = [
+    "embeddingStatus", "factStatus", "vectorStatus", "topicStatus", "error",
+    "embeddedAt", "factsExtractedAt", "topicsExtractedAt", "vectorAttemptedAt", "updatedAt",
+  ];
+  return Object.fromEntries(keys.flatMap((key) => enrichment[key] === undefined ? [] : [[key, enrichment[key]]]));
 }
 
 export async function listTopics(request = api, options = {}) {
@@ -227,6 +269,19 @@ export async function listTopics(request = api, options = {}) {
 export async function readDocument(documentId, request = api) {
   const document = await request(`/v3/documents/${encodeURIComponent(documentId)}`);
   const index = documentIndex(document);
-  const text = `${formatIndexItem(index)}\n\n原文の記録（当時の依頼・報告。現在の状態は必要に応じて照合）\nImported source paths are historical provenance labels. Retrieve further memory through Supermemory; local Codex built-in memory files are outside this retrieval path.\n\n${document.content || document.summary || ""}`;
-  return { text, document: { ...document, index } };
+  const content = sanitizedDocumentContent(document);
+  const projectedIndex = publicIndex(index);
+  const enrichment = publicEnrichment(document.enrichment);
+  const text = `${formatIndexItem(index)}\n\nこれは過去の記録です。現在の状態と照合して利用してください。\n\n${content}`;
+  return {
+    text,
+    document: {
+      id: String(document.id || ""),
+      content,
+      topics: index.topics,
+      ...(index.provenance ? { provenance: index.provenance } : {}),
+      index: projectedIndex,
+      ...(enrichment ? { enrichment } : {}),
+    },
+  };
 }

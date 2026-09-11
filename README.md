@@ -42,7 +42,7 @@ Keep the local Wrangler configuration for future updates. Never commit generated
 
 - Completed user requests and final answers are saved in the shared `memories` collection with deterministic IDs and source-folder provenance.
 - Use `listTopics` to find content categories, then pass a `topic` to `listDocuments` or `listMemories`. Lists include records across both legacy folder spaces and the shared collection. Use `topic: "__unclassified__"` to see records awaiting classification.
-- Manual `add_memory` saves to the shared collection. An absolute `sourceFolder` or a single workspace root supplied by the MCP client adds provenance; an explicit `containerTag` overrides storage. The plugin never uses its installation folder as the user's project. `listSpaces` exposes physical spaces for compatibility and diagnostics.
+- Manual `add_memory` saves to the shared collection. To forget a record after reading it, pass its `documentId` and source `containerTag`; exact stored content remains supported for compatibility. An absolute `sourceFolder` or a single workspace root supplied by the MCP client adds provenance; an explicit `containerTag` overrides storage. The plugin never uses its installation folder as the user's project. `listSpaces` exposes physical spaces for compatibility and diagnostics.
 - Prompt recall searches every discovered nonempty space by topic. The initial session event does not inject unrelated recent records.
 - Automatic context contains a title, description, section names, timestamps, and document IDs. Codex opens full records with `getDocument` when needed.
 - Capture redacts configured secrets and retries unacknowledged records. Local capture state stays under `cloudflare-memory/capture-state/` in the selected Codex home.

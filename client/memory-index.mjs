@@ -67,7 +67,7 @@ function matchingSection(content, terms) {
 
 export function documentIndex(document, fallbackContainer, terms = []) {
   const metadata = document.metadata && typeof document.metadata === "object" ? document.metadata : {};
-  const originalContent = String(document.content || document.memory || "");
+  const originalContent = String(document.content || document.memory || document.summary || "");
   const content = matchingSection(originalContent, terms);
   const sourceDates = [...new Set([...originalContent.matchAll(/^updated_at:\s*(\S+)\s*$/gm)].map((match) => match[1]).filter(validDate))];
   const originalDate = sourceDates.length === 1 ? sourceDates[0] : undefined;
@@ -125,6 +125,24 @@ export function documentIndex(document, fallbackContainer, terms = []) {
     part: Number.isInteger(metadata.part) ? metadata.part : undefined,
     parts: Number.isInteger(metadata.parts) ? metadata.parts : undefined,
     evidence: "historical record; inspect the document before relying on it",
+  };
+}
+
+export function publicIndex(item) {
+  return {
+    id: item.id,
+    title: item.title,
+    description: item.description,
+    containerTag: item.containerTag,
+    topics: item.topics,
+    sections: item.sections,
+    ...(item.sourceUpdatedAt ? { sourceUpdatedAt: item.sourceUpdatedAt } : {}),
+    ...(item.updatedAt ? { updatedAt: item.updatedAt } : {}),
+    ...(item.createdAt ? { createdAt: item.createdAt } : {}),
+    recallable: item.recallable,
+    ...(Number.isInteger(item.part) && Number.isInteger(item.parts) && item.parts > 1
+      ? { part: item.part, parts: item.parts }
+      : {}),
   };
 }
 

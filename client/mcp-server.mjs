@@ -40,16 +40,20 @@ const tools = [
   },
   {
     name: "add_memory",
-    description: "Save or forget a memory in the user's Cloudflare D1 database. Saves use the shared memories container by default; sourceFolder optionally records workspace provenance. An explicit containerTag overrides the physical storage container. Forget is always restricted to that one explicit or default container.",
+    description: "Save or forget a memory in the user's Cloudflare D1 database. Saves use the shared memories container by default; sourceFolder optionally records workspace provenance. Forget accepts a documentId from search/list/getDocument or exact stored content, and is always restricted to one explicit or default container.",
     inputSchema: {
       type: "object",
       properties: {
-        content: { type: "string", minLength: 1, maxLength: 200000 },
+        content: { type: "string", minLength: 1, maxLength: 200000, description: "Content to save, or exact stored content to forget when documentId is unavailable" },
+        documentId: { type: "string", minLength: 1, maxLength: 64, description: "Document ID returned by search_memory, listDocuments, or getDocument; valid only for forget" },
         action: { type: "string", enum: ["save", "forget"], default: "save" },
         containerTag: containerProperty,
         sourceFolder: sourceFolderProperty,
       },
-      required: ["content"],
+      anyOf: [
+        { required: ["content"] },
+        { properties: { action: { const: "forget" } }, required: ["action", "documentId"] },
+      ],
       additionalProperties: false,
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
@@ -145,12 +149,23 @@ export async function callTool(name, args, { request = api, context, settings, r
   }
 
   if (name === "add_memory") {
-    if (typeof args.content !== "string" || !args.content.trim() || args.content.length > 200_000) throw new Error("content must be a nonempty string of at most 200000 characters.");
     if (args.action !== undefined && args.action !== "save" && args.action !== "forget") throw new Error("action must be save or forget.");
+    const action = args.action || "save";
+    const hasContent = typeof args.content === "string" && args.content.trim().length > 0 && args.content.length <= 200_000;
+    const hasDocumentId = typeof args.documentId === "string" && args.documentId.trim().length > 0 && args.documentId.length <= 64;
+    if (action === "save" && !hasContent) throw new Error("content must be a nonempty string of at most 200000 characters.");
+    if (action === "save" && args.documentId !== undefined) throw new Error("documentId is valid only when action is forget.");
+    if (action === "forget" && !hasContent && !hasDocumentId) throw new Error("forget requires content or documentId.");
+    if (args.content !== undefined && !hasContent) throw new Error("content must be a nonempty string of at most 200000 characters.");
+    if (args.documentId !== undefined && !hasDocumentId) throw new Error("documentId must be a nonempty string of at most 64 characters.");
     const containerTag = explicitTag || DEFAULT_MEMORY_CONTAINER;
-    if (args.action === "forget") {
-      const result = await request("/v4/memories", { method: "DELETE", body: { containerTag, content: args.content } });
-      return textResult(result.message, { action: "forget", success: true, containerTag, message: result.message });
+    if (action === "forget") {
+      const result = await request("/v4/memories", { method: "DELETE", body: {
+        containerTag,
+        ...(hasDocumentId ? { documentId: args.documentId.trim() } : {}),
+        ...(hasContent ? { content: args.content } : {}),
+      } });
+      return textResult(result.message, { action: "forget", success: true, containerTag, message: result.message, id: result.id });
     }
 
     let workspace = explicitContext;
@@ -176,7 +191,7 @@ export async function callTool(name, args, { request = api, context, settings, r
     }
     const result = await listIndex({ containerTag: explicitTag, topic: args.topic?.trim(), page: args.page ?? 1, limit: args.limit ?? 10, request });
     const items = result.documents;
-    return textResult(JSON.stringify(items, null, 2), {
+    return textResult(JSON.stringify(items), {
       [name === "listMemories" ? "memoryEntries" : "documents"]: items,
       pagination: result.pagination,
       containerTag: result.containerTag,

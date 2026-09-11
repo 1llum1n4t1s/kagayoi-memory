@@ -7,6 +7,8 @@ import worker from "../src/index.ts";
 
 function d1Adapter(database) {
   let beforeFirst;
+  let beforeAll;
+  let beforeRun;
 
   function prepare(sql) {
     const operation = (values = []) => ({
@@ -18,8 +20,12 @@ function d1Adapter(database) {
         if (beforeFirst) return beforeFirst(sql, row);
         return row;
       },
-      all: async () => ({ results: database.prepare(sql).all(...values) }),
+      all: async () => {
+        const results = database.prepare(sql).all(...values);
+        return { results: beforeAll ? await beforeAll(sql, results) : results };
+      },
       run: async () => {
+        if (beforeRun) await beforeRun(sql, values);
         const result = database.prepare(sql).run(...values);
         return { meta: { changes: Number(result.changes) } };
       },
@@ -50,6 +56,58 @@ function d1Adapter(database) {
     interceptFirst(callback) {
       beforeFirst = callback;
     },
+    interceptAll(callback) {
+      beforeAll = callback;
+    },
+    interceptRun(callback) {
+      beforeRun = callback;
+    },
+  };
+}
+
+function openDatabase() {
+  const database = new DatabaseSync(":memory:");
+  database.exec("PRAGMA foreign_keys = ON");
+  for (const name of [
+    "0001_initial.sql",
+    "0002_semantic_graph.sql",
+    "0003_vector_resilience.sql",
+    "0004_content_topics.sql",
+  ]) {
+    database.exec(readFileSync(resolve(import.meta.dirname, "..", "migrations", name), "utf8"));
+  }
+  return database;
+}
+
+function deferred() {
+  let resolvePromise;
+  const promise = new Promise((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}
+
+function embedding(first = 1, second = 0) {
+  const values = Array(1_024).fill(0);
+  values[0] = first;
+  values[1] = second;
+  return values;
+}
+
+function enrichment(facts, topics) {
+  return {
+    choices: [{ message: { content: JSON.stringify({ facts, topics }) } }],
+  };
+}
+
+function baseEnvironment(DB, overrides = {}) {
+  return {
+    DB,
+    MEMORY_API_KEY: "test-key",
+    AI_ENRICHMENT_MODE: "off",
+    AI: { run: async () => { throw new Error("AI should not run"); } },
+    MEMORY_VECTORS: {},
+    ...overrides,
   };
 }
 
@@ -73,27 +131,12 @@ test("same-millisecond retry cannot restore stale topics after a content patch",
     }
   };
 
-  const database = new DatabaseSync(":memory:");
+  const database = openDatabase();
   try {
-    database.exec("PRAGMA foreign_keys = ON");
-    for (const name of [
-      "0001_initial.sql",
-      "0002_semantic_graph.sql",
-      "0003_vector_resilience.sql",
-      "0004_content_topics.sql",
-    ]) {
-      database.exec(readFileSync(resolve(import.meta.dirname, "..", "migrations", name), "utf8"));
-    }
     const DB = d1Adapter(database);
     const waits = [];
     const ctx = { waitUntil: (promise) => waits.push(promise) };
-    const env = {
-      DB,
-      MEMORY_API_KEY: "test-key",
-      AI_ENRICHMENT_MODE: "off",
-      AI: { run: async () => { throw new Error("AI should not run"); } },
-      MEMORY_VECTORS: {},
-    };
+    const env = baseEnvironment(DB);
 
     const saved = await worker.fetch(request("/v3/documents", {
       containerTag: "legacy-folder",
@@ -132,5 +175,1540 @@ test("same-millisecond retry cannot restore stale topics after a content patch",
   } finally {
     database.close();
     globalThis.Date = OriginalDate;
+  }
+});
+
+test("accepts a maximum-length multibyte document body", async () => {
+  const database = openDatabase();
+  try {
+    const env = baseEnvironment(d1Adapter(database));
+    const response = await worker.fetch(request("/v3/documents", {
+      containerTag: "multibyte-body",
+      customId: "maximum-content",
+      content: "あ".repeat(200_000),
+      entityContext: "文脈".repeat(8_000),
+      metadata: { note: "メタデータ".repeat(4_000) },
+    }), env, { waitUntil() {} });
+
+    assert.equal(response.status, 201);
+  } finally {
+    database.close();
+  }
+});
+
+test("forget accepts a document ID only within its named container", async () => {
+  const database = openDatabase();
+  try {
+    const env = baseEnvironment(d1Adapter(database));
+    const ctx = { waitUntil() {} };
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "forget-by-id",
+      content: "# Imported title\n\nSession: old-session\nTurn: 1\n\nSanitized body.",
+      metadata: { captureVersion: 2, title: "Imported title", sessionId: "old-session", turn: 1 },
+    }), env, ctx);
+    const id = (await saved.json()).id;
+
+    const wrongContainer = await worker.fetch(request("/v4/memories", {
+      containerTag: "memories",
+      documentId: id,
+    }, "DELETE"), env, ctx);
+    assert.equal((await wrongContainer.json()).id, null);
+    assert.equal(database.prepare("SELECT is_forgotten FROM memories WHERE id = ?").get(id).is_forgotten, 0);
+
+    const forgotten = await worker.fetch(request("/v4/memories", {
+      containerTag: "forget-by-id",
+      documentId: id,
+    }, "DELETE"), env, ctx);
+    assert.equal(forgotten.status, 200);
+    assert.deepEqual(await forgotten.json(), { id, message: "Memory forgotten" });
+    assert.equal(database.prepare("SELECT is_forgotten FROM memories WHERE id = ?").get(id).is_forgotten, 1);
+  } finally {
+    database.close();
+  }
+});
+
+test("capture reuse ignores forgotten rows and restores a forgotten shared capture", async () => {
+  const database = openDatabase();
+  try {
+    const env = baseEnvironment(d1Adapter(database));
+    const ctx = { waitUntil() {} };
+    const captureKey = "capture-session:forgotten:0123456789abcdef";
+    const customId = `codex-turn-v2:${captureKey}`;
+    const metadata = {
+      captureVersion: 2,
+      captureKey,
+      sm_project_id: "forgotten-project",
+    };
+
+    const legacy = await worker.fetch(request("/v3/documents", {
+      containerTag: "forgotten-project",
+      customId,
+      content: "Forgotten legacy capture.",
+      metadata,
+    }), env, ctx);
+    const legacyId = (await legacy.json()).id;
+    const forgottenLegacy = await worker.fetch(request("/v4/memories", {
+      containerTag: "forgotten-project",
+      content: "Forgotten legacy capture.",
+    }, "DELETE"), env, ctx);
+    assert.equal(forgottenLegacy.status, 200);
+
+    const active = await worker.fetch(request("/v3/documents", {
+      containerTag: "memories",
+      customId,
+      content: "Active shared capture.",
+      metadata,
+    }), env, ctx);
+    const activeId = (await active.json()).id;
+    assert.notEqual(activeId, legacyId);
+
+    const reused = await worker.fetch(request("/v3/documents", {
+      containerTag: "memories",
+      customId,
+      content: "This content must not replace the active capture.",
+      metadata,
+      reuseExistingCapture: true,
+    }), env, ctx);
+    const reusedBody = await reused.json();
+    assert.equal(reused.status, 201);
+    assert.equal(reusedBody.id, activeId);
+    assert.equal(reusedBody.reusedExistingCapture, true);
+    assert.equal(database.prepare("SELECT is_forgotten FROM memories WHERE id = ?").get(legacyId).is_forgotten, 1);
+
+    const restoreKey = "capture-session:restore:fedcba9876543210";
+    const restoreCustomId = `codex-turn-v2:${restoreKey}`;
+    const restoreMetadata = {
+      captureVersion: 2,
+      captureKey: restoreKey,
+      sm_project_id: "memories",
+    };
+    const original = await worker.fetch(request("/v3/documents", {
+      containerTag: "memories",
+      customId: restoreCustomId,
+      content: "Capture before forget.",
+      metadata: restoreMetadata,
+    }), env, ctx);
+    const originalId = (await original.json()).id;
+    const forgotten = await worker.fetch(request("/v4/memories", {
+      containerTag: "memories",
+      content: "Capture before forget.",
+    }, "DELETE"), env, ctx);
+    assert.equal(forgotten.status, 200);
+
+    const restored = await worker.fetch(request("/v3/documents", {
+      containerTag: "memories",
+      customId: restoreCustomId,
+      content: "Capture after forget.",
+      metadata: restoreMetadata,
+      reuseExistingCapture: true,
+    }), env, ctx);
+    const restoredBody = await restored.json();
+    assert.equal(restored.status, 201);
+    assert.equal(restoredBody.id, originalId);
+    assert.equal(restoredBody.reusedExistingCapture, undefined);
+
+    const restoredDocument = await worker.fetch(new Request(`https://memory.example/v3/documents/${originalId}`, {
+      headers: { Authorization: "Bearer test-key" },
+    }), env, ctx);
+    assert.equal(restoredDocument.status, 200);
+    assert.equal((await restoredDocument.json()).content, "Capture after forget.");
+    assert.deepEqual(
+      { ...database.prepare("SELECT is_forgotten, content FROM memories WHERE id = ?").get(originalId) },
+      { is_forgotten: 0, content: "Capture after forget." },
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("patch rejects forgotten documents without changing them", async () => {
+  const database = openDatabase();
+  try {
+    const env = baseEnvironment(d1Adapter(database));
+    const ctx = { waitUntil() {} };
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "forgotten-patch",
+      customId: "target",
+      content: "Original forgotten content.",
+      metadata: { note: "original" },
+    }), env, ctx);
+    const id = (await saved.json()).id;
+    const forgotten = await worker.fetch(request("/v4/memories", {
+      containerTag: "forgotten-patch",
+      content: "Original forgotten content.",
+    }, "DELETE"), env, ctx);
+    assert.equal(forgotten.status, 200);
+    const beforePatch = { ...database.prepare("SELECT * FROM memories WHERE id = ?").get(id) };
+
+    const patched = await worker.fetch(request(`/v3/documents/${id}`, {
+      content: "Mutated forgotten content.",
+      metadata: { note: "mutated" },
+    }, "PATCH"), env, ctx);
+    assert.equal(patched.status, 404);
+    assert.deepEqual(
+      { ...database.prepare("SELECT * FROM memories WHERE id = ?").get(id) },
+      beforePatch,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("patch loses to a same-millisecond forget after its initial read", async () => {
+  const OriginalDate = globalThis.Date;
+  const fixedTime = "2026-09-11T01:00:00.000Z";
+  globalThis.Date = class extends OriginalDate {
+    constructor(...args) {
+      super(...(args.length === 0 ? [fixedTime] : args));
+    }
+    static now() {
+      return OriginalDate.parse(fixedTime);
+    }
+  };
+
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const env = baseEnvironment(DB);
+    const ctx = { waitUntil() {} };
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "forget-patch-race",
+      customId: "target",
+      content: "Original race content.",
+      metadata: { note: "original" },
+    }), env, ctx);
+    const id = (await saved.json()).id;
+    let intercepted = false;
+    let rowAfterForget;
+    DB.interceptFirst(async (sql, row) => {
+      if (intercepted || !sql.includes("SELECT * FROM memories WHERE id = ? AND is_forgotten = 0")) {
+        return row;
+      }
+      intercepted = true;
+      const forgotten = await worker.fetch(request("/v4/memories", {
+        containerTag: "forget-patch-race",
+        content: "Original race content.",
+      }, "DELETE"), env, ctx);
+      assert.equal(forgotten.status, 200);
+      rowAfterForget = { ...database.prepare("SELECT * FROM memories WHERE id = ?").get(id) };
+      return row;
+    });
+
+    const patched = await worker.fetch(request(`/v3/documents/${id}`, {
+      content: "Race mutation must not persist.",
+      metadata: { note: "mutated" },
+    }, "PATCH"), env, ctx);
+    assert.equal(patched.status, 409);
+    assert.equal(intercepted, true);
+    assert.deepEqual(
+      { ...database.prepare("SELECT * FROM memories WHERE id = ?").get(id) },
+      rowAfterForget,
+    );
+  } finally {
+    database.close();
+    globalThis.Date = OriginalDate;
+  }
+});
+
+test("stores valid facts while empty normalized topics fail independently", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const waits = [];
+    const fact = {
+      subject: "User",
+      predicate: "uses",
+      object: "D1",
+      confidence: 0.9,
+      exclusive: false,
+    };
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: {
+        run: async (model) => model.includes("bge-m3")
+          ? { data: [embedding()] }
+          : enrichment([fact], ["__unclassified__", "0123456789abcdef"]),
+      },
+      MEMORY_VECTORS: {
+        upsert: async () => ({ mutationId: "topic-empty" }),
+      },
+    });
+
+    const response = await worker.fetch(request("/v3/documents", {
+      containerTag: "empty-topics",
+      customId: "facts-survive",
+      content: "The user uses D1.",
+    }), env, { waitUntil: (promise) => waits.push(promise) });
+    const { id } = await response.json();
+    await Promise.all(waits);
+
+    const stored = database.prepare(
+      "SELECT fact_status, topic_status FROM memories WHERE id = ?",
+    ).get(id);
+    const facts = database.prepare("SELECT subject, predicate, object FROM facts WHERE source_memory_id = ?").all(id);
+    const topics = database.prepare("SELECT topic FROM memory_topics WHERE memory_id = ?").all(id);
+    assert.deepEqual({ ...stored }, { fact_status: "done", topic_status: "failed" });
+    assert.deepEqual(facts.map((row) => ({ ...row })), [{ subject: "User", predicate: "uses", object: "D1" }]);
+    assert.deepEqual(topics.map((row) => ({ ...row })), []);
+
+    waits.length = 0;
+    const explicitResponse = await worker.fetch(request("/v3/documents", {
+      containerTag: "empty-topics",
+      customId: "explicit-topics",
+      content: "The user uses D1.",
+      metadata: { topics: ["Database"] },
+    }), env, { waitUntil: (promise) => waits.push(promise) });
+    const explicitId = (await explicitResponse.json()).id;
+    await Promise.all(waits);
+    assert.equal(
+      database.prepare("SELECT topic_status FROM memories WHERE id = ?").get(explicitId).topic_status,
+      "done",
+    );
+    assert.deepEqual(
+      database.prepare("SELECT topic FROM memory_topics WHERE memory_id = ?").all(explicitId)
+        .map((row) => row.topic),
+      ["Database"],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("upsert and patch atomically clear derived facts and restore unsupported facts", async () => {
+  const database = openDatabase();
+  try {
+    const env = baseEnvironment(d1Adapter(database));
+    const ctx = { waitUntil() {} };
+    const previousResponse = await worker.fetch(request("/v3/documents", {
+      containerTag: "fact-updates",
+      customId: "previous",
+      content: "The color was green.",
+    }), env, ctx);
+    const targetResponse = await worker.fetch(request("/v3/documents", {
+      containerTag: "fact-updates",
+      customId: "target",
+      content: "The color is blue.",
+    }), env, ctx);
+    const previousId = (await previousResponse.json()).id;
+    const targetId = (await targetResponse.json()).id;
+    const now = new Date().toISOString();
+
+    const seedSupersedingFact = (suffix) => {
+      const previousFactId = `previous-${suffix}`;
+      const targetFactId = `target-${suffix}`;
+      database.prepare(
+        `INSERT INTO facts(
+           id, container_tag, source_memory_id, subject, predicate, object,
+           subject_key, predicate_key, object_key, is_exclusive, confidence, status,
+           created_at, updated_at
+         ) VALUES (?, 'fact-updates', ?, 'User', 'color', 'green', 'user', 'color', 'green', 1, 0.8, 'superseded', ?, ?)`,
+      ).run(previousFactId, previousId, now, now);
+      database.prepare(
+        `INSERT INTO facts(
+           id, container_tag, source_memory_id, subject, predicate, object,
+           subject_key, predicate_key, object_key, is_exclusive, confidence, status,
+           created_at, updated_at
+         ) VALUES (?, 'fact-updates', ?, 'User', 'color', 'blue', 'user', 'color', 'blue', 1, 0.9, 'active', ?, ?)`,
+      ).run(targetFactId, targetId, now, now);
+      database.prepare(
+        `INSERT INTO fact_relations(
+           id, container_tag, from_fact_id, relation, to_fact_id,
+           source_memory_id, confidence, created_at
+         ) VALUES (?, 'fact-updates', ?, 'supersedes', ?, ?, 0.8, ?)`,
+      ).run(`relation-${suffix}`, targetFactId, previousFactId, targetId, now);
+      return previousFactId;
+    };
+
+    let previousFactId = seedSupersedingFact("upsert");
+    const upserted = await worker.fetch(request("/v3/documents", {
+      containerTag: "fact-updates",
+      customId: "target",
+      content: "The color changed without enrichment.",
+    }), env, ctx);
+    assert.equal(upserted.status, 201);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM facts WHERE source_memory_id = ?").get(targetId).count, 0);
+    assert.equal(database.prepare("SELECT status FROM facts WHERE id = ?").get(previousFactId).status, "active");
+
+    database.prepare("DELETE FROM facts WHERE id = ?").run(previousFactId);
+    previousFactId = seedSupersedingFact("patch");
+    const patched = await worker.fetch(request(`/v3/documents/${targetId}`, {
+      content: "The color changed again without enrichment.",
+    }, "PATCH"), env, ctx);
+    assert.equal(patched.status, 200);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM facts WHERE source_memory_id = ?").get(targetId).count, 0);
+    assert.equal(database.prepare("SELECT status FROM facts WHERE id = ?").get(previousFactId).status, "active");
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM fact_relations").get().count, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("stale enrichment cannot mutate current facts or enqueue a stale vector", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const ctx = { waits: [], waitUntil(promise) { this.waits.push(promise); } };
+    const env = baseEnvironment(DB);
+    const previousResponse = await worker.fetch(request("/v3/documents", {
+      containerTag: "fact-race",
+      customId: "previous",
+      content: "The color was green.",
+    }), env, ctx);
+    const targetResponse = await worker.fetch(request("/v3/documents", {
+      containerTag: "fact-race",
+      customId: "target",
+      content: "The color is blue.",
+    }), env, ctx);
+    const previousId = (await previousResponse.json()).id;
+    const targetId = (await targetResponse.json()).id;
+    const now = new Date().toISOString();
+    database.prepare(
+      `INSERT INTO facts(
+         id, container_tag, source_memory_id, subject, predicate, object,
+         subject_key, predicate_key, object_key, is_exclusive, confidence, status,
+         created_at, updated_at
+       ) VALUES ('previous-green', 'fact-race', ?, 'User', 'color', 'green',
+                 'user', 'color', 'green', 1, 0.8, 'active', ?, ?)`,
+    ).run(previousId, now, now);
+
+    const embeddingResult = deferred();
+    const enrichmentResult = deferred();
+    const aiStarted = deferred();
+    let aiCalls = 0;
+    let vectorUpserts = 0;
+    env.AI_ENRICHMENT_MODE = "on";
+    env.AI = {
+      run: async (model) => {
+        aiCalls += 1;
+        if (aiCalls === 2) aiStarted.resolve();
+        return model.includes("bge-m3") ? embeddingResult.promise : enrichmentResult.promise;
+      },
+    };
+    env.MEMORY_VECTORS = {
+      upsert: async () => {
+        vectorUpserts += 1;
+        return { mutationId: "stale" };
+      },
+    };
+
+    const retry = await worker.fetch(request("/v4/enrich", { id: targetId }), env, ctx);
+    assert.equal(retry.status, 202);
+    await aiStarted.promise;
+
+    let raced = false;
+    DB.interceptRun(async (sql) => {
+      if (raced || !sql.includes("SET embedding_status = 'done'")) return;
+      raced = true;
+      env.AI_ENRICHMENT_MODE = "off";
+      const patched = await worker.fetch(request(`/v3/documents/${targetId}`, {
+        content: "The current color is red.",
+      }, "PATCH"), env, ctx);
+      assert.equal(patched.status, 200);
+      const currentNow = new Date().toISOString();
+      database.prepare(
+        `INSERT INTO facts(
+           id, container_tag, source_memory_id, subject, predicate, object,
+           subject_key, predicate_key, object_key, is_exclusive, confidence, status,
+           created_at, updated_at
+         ) VALUES ('current-red', 'fact-race', ?, 'User', 'color', 'red',
+                   'user', 'color', 'red', 1, 0.95, 'active', ?, ?)`,
+      ).run(targetId, currentNow, currentNow);
+      database.prepare("UPDATE facts SET status = 'superseded' WHERE id = 'previous-green'").run();
+      database.prepare(
+        `INSERT INTO fact_relations(
+           id, container_tag, from_fact_id, relation, to_fact_id,
+           source_memory_id, confidence, created_at
+         ) VALUES ('current-relation', 'fact-race', 'current-red', 'supersedes',
+                   'previous-green', ?, 0.8, ?)`,
+      ).run(targetId, currentNow);
+      env.AI_ENRICHMENT_MODE = "on";
+    });
+
+    embeddingResult.resolve({ data: [embedding()] });
+    enrichmentResult.resolve(enrichment([{
+      subject: "User",
+      predicate: "color",
+      object: "blue",
+      confidence: 0.9,
+      exclusive: true,
+    }], ["Color"]));
+    await Promise.all(ctx.waits);
+
+    assert.equal(raced, true);
+    assert.equal(vectorUpserts, 0);
+    assert.deepEqual(
+      database.prepare("SELECT id, object, status FROM facts ORDER BY id").all().map((row) => ({ ...row })),
+      [
+        { id: "current-red", object: "red", status: "active" },
+        { id: "previous-green", object: "green", status: "superseded" },
+      ],
+    );
+    assert.deepEqual(
+      database.prepare("SELECT id, from_fact_id, to_fact_id FROM fact_relations").all().map((row) => ({ ...row })),
+      [{ id: "current-relation", from_fact_id: "current-red", to_fact_id: "previous-green" }],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("semantic search ignores stale vector revisions and reconciliation replaces them", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const response = await worker.fetch(request("/v3/documents", {
+      containerTag: "vector-revision",
+      customId: "semantic",
+      content: "Unrelated stored text.",
+    }), baseEnvironment(DB), { waitUntil() {} });
+    const { id } = await response.json();
+    const row = database.prepare("SELECT topic_revision FROM memories WHERE id = ?").get(id);
+    database.prepare(
+      "UPDATE memories SET embedding_json = ?, embedding_status = 'done', vector_status = 'pending' WHERE id = ?",
+    ).run(JSON.stringify(embedding(0, 1)), id);
+
+    let storedVector = { id, values: embedding(1, 0), metadata: { topic_revision: "stale-revision" } };
+    const upserts = [];
+    let queryOptions;
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: { run: async () => ({ data: [embedding(1, 0)] }) },
+      MEMORY_VECTORS: {
+        query: async (_vector, options) => {
+          queryOptions = options;
+          return {
+            matches: [{ id, score: 0.99, metadata: storedVector.metadata }],
+            count: 1,
+          };
+        },
+        getByIds: async () => [storedVector],
+        upsert: async (vectors) => {
+          upserts.push(vectors);
+          [storedVector] = vectors;
+          return { mutationId: "reconciled" };
+        },
+      },
+    });
+
+    const search = await worker.fetch(request("/v4/search", {
+      containerTag: "vector-revision",
+      q: "semantic needle",
+    }), env, { waitUntil() {} });
+    const searchBody = await search.json();
+    assert.equal(searchBody.results.length, 1);
+    assert.equal(searchBody.results[0].similarity, 0);
+    assert.equal(searchBody.results[0].semanticSimilarity, 0);
+    assert.equal(queryOptions.returnMetadata, "all");
+
+    const firstWaits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => firstWaits.push(promise) });
+    await Promise.all(firstWaits);
+    assert.equal(upserts.length, 1);
+    assert.equal(upserts[0][0].metadata.topic_revision, row.topic_revision);
+    assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "queued");
+
+    const secondWaits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => secondWaits.push(promise) });
+    await Promise.all(secondWaits);
+    assert.equal(upserts.length, 1);
+    assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "indexed");
+
+    const currentSearch = await worker.fetch(request("/v4/search", {
+      containerTag: "vector-revision",
+      q: "semantic needle",
+    }), env, { waitUntil() {} });
+    const currentSearchBody = await currentSearch.json();
+    assert.equal(currentSearchBody.results[0].similarity, 0.99);
+    assert.equal(currentSearchBody.results[0].semanticSimilarity, 0.99);
+  } finally {
+    database.close();
+  }
+});
+
+test("reconciliation status updates cannot overwrite a newer document revision", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const env = baseEnvironment(DB);
+    const response = await worker.fetch(request("/v3/documents", {
+      containerTag: "reconcile-race",
+      customId: "race",
+      content: "Old vector content.",
+    }), env, { waitUntil() {} });
+    const { id } = await response.json();
+    const oldRevision = database.prepare("SELECT topic_revision FROM memories WHERE id = ?").get(id).topic_revision;
+    database.prepare(
+      "UPDATE memories SET embedding_json = ?, embedding_status = 'done', vector_status = 'pending' WHERE id = ?",
+    ).run(JSON.stringify(embedding()), id);
+
+    const getResult = deferred();
+    const getStarted = deferred();
+    const upserts = [];
+    env.AI_ENRICHMENT_MODE = "on";
+    env.MEMORY_VECTORS = {
+      getByIds: async () => {
+        getStarted.resolve();
+        return getResult.promise;
+      },
+      upsert: async (vectors) => {
+        upserts.push(vectors);
+        return { mutationId: "old-revision" };
+      },
+    };
+
+    const waits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => waits.push(promise) });
+    await getStarted.promise;
+    env.AI_ENRICHMENT_MODE = "off";
+    const patched = await worker.fetch(request(`/v3/documents/${id}`, {
+      content: "New vector content.",
+    }, "PATCH"), env, { waitUntil() {} });
+    assert.equal(patched.status, 200);
+    getResult.resolve([{ id, values: embedding(), metadata: { topic_revision: "stale" } }]);
+    await Promise.all(waits);
+
+    assert.equal(upserts.length, 1);
+    assert.equal(upserts[0][0].metadata.topic_revision, oldRevision);
+    assert.deepEqual(
+      { ...database.prepare("SELECT embedding_json, vector_status FROM memories WHERE id = ?").get(id) },
+      { embedding_json: null, vector_status: "disabled" },
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("fact replacement limits candidates before relation classification and supersedes only related facts", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const baseEnv = baseEnvironment(DB);
+    const ctx = { waitUntil() {} };
+    const previousFacts = [
+      ["non-match-old", "preference", "match", "2026-01-01T00:00:00.000Z"],
+      ["non-recent-3", "preference", "other-3", "2026-01-02T00:00:00.000Z"],
+      ["non-recent-2", "preference", "other-2", "2026-01-03T00:00:00.000Z"],
+      ["non-recent-1", "preference", "other-1", "2026-01-04T00:00:00.000Z"],
+      ["exclusive-old-c", "backend", "old-c", "2026-01-05T00:00:00.000Z"],
+      ["exclusive-old-b", "backend", "old-b", "2026-01-06T00:00:00.000Z"],
+      ["exclusive-old-a", "backend", "old-a", "2026-01-07T00:00:00.000Z"],
+      ["exclusive-same", "backend", "new", "2026-01-08T00:00:00.000Z"],
+    ];
+    for (const [customId, predicate, object, updatedAt] of previousFacts) {
+      const response = await worker.fetch(request("/v3/documents", {
+        containerTag: "fact-candidates",
+        customId,
+        content: `${predicate}: ${object}`,
+      }), baseEnv, ctx);
+      const { id } = await response.json();
+      database.prepare(
+        `INSERT INTO facts(
+           id, container_tag, source_memory_id, subject, predicate, object,
+           subject_key, predicate_key, object_key, is_exclusive, confidence, status,
+           created_at, updated_at
+         ) VALUES (?, 'fact-candidates', ?, 'User', ?, ?, 'user', ?, ?, 0, 0.8, 'active', ?, ?)`,
+      ).run(`fact-${customId}`, id, predicate, object, predicate, object, updatedAt, updatedAt);
+    }
+
+    const targetResponse = await worker.fetch(request("/v3/documents", {
+      containerTag: "fact-candidates",
+      customId: "target",
+      content: "Current durable facts.",
+      metadata: { topics: ["Facts"] },
+    }), baseEnv, ctx);
+    const targetId = (await targetResponse.json()).id;
+    const waits = [];
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: {
+        run: async (model) => model.includes("bge-m3")
+          ? { data: [embedding()] }
+          : enrichment([
+            {
+              subject: "User",
+              predicate: "preference",
+              object: "match",
+              confidence: 0.9,
+              exclusive: false,
+            },
+            {
+              subject: "User",
+              predicate: "backend",
+              object: "new",
+              confidence: 0.95,
+              exclusive: true,
+            },
+          ], ["Facts"]),
+      },
+      MEMORY_VECTORS: { upsert: async () => ({ mutationId: "facts" }) },
+    });
+    const retry = await worker.fetch(request("/v4/enrich", { id: targetId }), env, {
+      waitUntil: (promise) => waits.push(promise),
+    });
+    assert.equal(retry.status, 202);
+    await Promise.all(waits);
+
+    const relations = database.prepare(
+      `SELECT newer.predicate, relation.relation, older.object
+       FROM fact_relations AS relation
+       JOIN facts AS newer ON newer.id = relation.from_fact_id
+       JOIN facts AS older ON older.id = relation.to_fact_id
+       WHERE relation.source_memory_id = ?
+       ORDER BY newer.predicate, relation.relation, older.object`,
+    ).all(targetId).map((row) => ({ ...row }));
+    assert.deepEqual(relations, [
+      { predicate: "backend", relation: "supersedes", object: "old-a" },
+      { predicate: "backend", relation: "supersedes", object: "old-b" },
+      { predicate: "backend", relation: "supports", object: "new" },
+    ]);
+    assert.deepEqual(
+      database.prepare(
+        "SELECT object, status FROM facts WHERE predicate = 'backend' AND source_memory_id <> ? ORDER BY object",
+      ).all(targetId).map((row) => ({ ...row })),
+      [
+        { object: "new", status: "active" },
+        { object: "old-a", status: "superseded" },
+        { object: "old-b", status: "superseded" },
+        { object: "old-c", status: "active" },
+      ],
+    );
+    assert.equal(
+      database.prepare(
+        "SELECT COUNT(*) AS count FROM fact_relations AS r JOIN facts AS f ON f.id = r.from_fact_id WHERE f.predicate = 'preference'",
+      ).get().count,
+      0,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("legacy vector hits beyond the D1 scan are cosine-scored and indexed vectors migrate fairly", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const containerTag = "legacy-vectors";
+    database.prepare(
+      "INSERT INTO container_tags(tag, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    ).run(containerTag, "Legacy vectors", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
+    const insert = database.prepare(
+      `INSERT INTO memories(
+         id, custom_id, container_tag, content, metadata_json, status, is_forgotten,
+         embedding_status, fact_status, embedding_json, vector_status, topic_status,
+         topic_revision, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, '{}', 'done', 0, 'done', 'done', ?, 'indexed', 'done', ?, ?, ?)`,
+    );
+    const vectors = new Map();
+    database.exec("BEGIN");
+    try {
+      for (let index = 0; index < 201; index += 1) {
+        const suffix = String(index).padStart(3, "0");
+        const id = `legacy-${suffix}`;
+        const revision = `revision-${suffix}`;
+        const timestamp = new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString();
+        const values = index === 0 ? embedding(1, 0) : embedding(0, 1);
+        insert.run(id, id, containerTag, `Stored legacy memory ${suffix}.`, JSON.stringify(values), revision, timestamp, timestamp);
+        vectors.set(id, { id, values, metadata: {} });
+      }
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+
+    const migrated = new Set();
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: { run: async () => ({ data: [embedding(1, 0)] }) },
+      MEMORY_VECTORS: {
+        query: async () => ({
+          matches: [{ id: "legacy-000", score: -0.5, metadata: {} }],
+          count: 1,
+        }),
+        getByIds: async (ids) => ids.map((id) => vectors.get(id)).filter(Boolean),
+        upsert: async (nextVectors) => {
+          for (const vector of nextVectors) {
+            vectors.set(vector.id, vector);
+            migrated.add(vector.id);
+          }
+          return { mutationId: `legacy-${migrated.size}` };
+        },
+      },
+    });
+
+    const search = await worker.fetch(request("/v4/search", {
+      containerTag,
+      q: "semantic needle",
+    }), env, { waitUntil() {} });
+    const searchBody = await search.json();
+    assert.equal(searchBody.results[0].id, "legacy-000");
+    assert.equal(searchBody.results[0].similarity, 0.99);
+
+    for (let pass = 0; pass < 22; pass += 1) {
+      const waits = [];
+      worker.scheduled({}, env, { waitUntil: (promise) => waits.push(promise) });
+      await Promise.all(waits);
+    }
+    assert.equal(migrated.size, 201);
+    assert.equal(
+      database.prepare("SELECT COUNT(*) AS count FROM memories WHERE vector_status <> 'indexed'").get().count,
+      0,
+    );
+    for (const [id, vector] of vectors) {
+      assert.equal(vector.metadata.topic_revision, database.prepare(
+        "SELECT topic_revision FROM memories WHERE id = ?",
+      ).get(id).topic_revision);
+    }
+  } finally {
+    database.close();
+  }
+});
+
+test("a late old vector upsert is repaired while the current D1 revision stays authoritative", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const oldUpsertStarted = deferred();
+    const releaseOldUpsert = deferred();
+    let upsertCalls = 0;
+    let storedVector;
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: {
+        run: async (model, input) => {
+          if (!model.includes("bge-m3")) return enrichment([], ["Race"]);
+          const content = input.text[0];
+          return { data: [content.includes("Old") ? embedding(1, 0) : embedding(0, 1)] };
+        },
+      },
+      MEMORY_VECTORS: {
+        upsert: async (vectors) => {
+          upsertCalls += 1;
+          if (upsertCalls === 1) {
+            oldUpsertStarted.resolve();
+            await releaseOldUpsert.promise;
+          }
+          [storedVector] = vectors;
+          return { mutationId: `mutation-${upsertCalls}` };
+        },
+        getByIds: async () => storedVector ? [storedVector] : [],
+      },
+    });
+
+    const oldWaits = [];
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "late-vector",
+      customId: "race",
+      content: "Old vector content.",
+    }), env, { waitUntil: (promise) => oldWaits.push(promise) });
+    const { id } = await saved.json();
+    await oldUpsertStarted.promise;
+    const oldRevision = storedVector?.metadata?.topic_revision ?? database.prepare(
+      "SELECT topic_revision FROM memories WHERE id = ?",
+    ).get(id).topic_revision;
+
+    const currentWaits = [];
+    const patched = await worker.fetch(request(`/v3/documents/${id}`, {
+      content: "Current vector content.",
+    }, "PATCH"), env, { waitUntil: (promise) => currentWaits.push(promise) });
+    assert.equal(patched.status, 200);
+    await Promise.all(currentWaits);
+    const currentRevision = database.prepare("SELECT topic_revision FROM memories WHERE id = ?").get(id).topic_revision;
+    assert.equal(storedVector.metadata.topic_revision, currentRevision);
+
+    let waits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => waits.push(promise) });
+    await Promise.all(waits);
+    assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "indexed");
+
+    releaseOldUpsert.resolve();
+    await Promise.all(oldWaits);
+    assert.notEqual(oldRevision, currentRevision);
+    assert.equal(storedVector.metadata.topic_revision, oldRevision);
+    assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "indexed");
+
+    waits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => waits.push(promise) });
+    await Promise.all(waits);
+    assert.equal(storedVector.metadata.topic_revision, currentRevision);
+    assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "queued");
+
+    waits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => waits.push(promise) });
+    await Promise.all(waits);
+    assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "indexed");
+  } finally {
+    database.close();
+  }
+});
+
+test("search and document-list compact projections omit full content without changing defaults", async () => {
+  const database = openDatabase();
+  try {
+    const env = baseEnvironment(d1Adapter(database));
+    const metadata = {
+      title: "Projection index",
+      filepath: "docs/projection.md",
+      memoryIndex: {
+        version: 1,
+        title: "Projection index",
+        description: "Find the compact projection",
+        sections: ["Projection"],
+        recallable: true,
+        sourceKind: "conversation",
+      },
+      topics: ["Projection"],
+    };
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "projection-space",
+      customId: "projection-document",
+      content: "Projection needle with full private detail.",
+      metadata,
+    }), env, { waitUntil() {} });
+    const { id } = await saved.json();
+
+    const fullSearch = await worker.fetch(request("/v4/search", {
+      containerTag: "projection-space",
+      q: "Projection needle",
+    }), env, { waitUntil() {} }).then((response) => response.json());
+    assert.match(fullSearch.results[0].content, /full private detail/);
+    assert.equal(fullSearch.results[0].memory, fullSearch.results[0].content);
+
+    const indexSearch = await worker.fetch(request("/v4/search", {
+      containerTag: "projection-space",
+      q: "Projection needle",
+      indexOnly: true,
+    }), env, { waitUntil() {} }).then((response) => response.json());
+    assert.equal(indexSearch.results[0].id, id);
+    assert.equal("content" in indexSearch.results[0], false);
+    assert.equal("memory" in indexSearch.results[0], false);
+    assert.equal("summary" in indexSearch.results[0], false);
+    for (const field of [
+      "metadata", "topics", "provenance", "title", "filepath", "containerTag",
+      "createdAt", "updatedAt", "similarity", "score",
+    ]) assert.equal(field in indexSearch.results[0], true, field);
+
+    const fullList = await worker.fetch(request("/v3/documents/list", {
+      containerTag: "projection-space",
+    }), env, { waitUntil() {} }).then((response) => response.json());
+    assert.match(fullList.documents[0].content, /full private detail/);
+    assert.equal(fullList.memoryEntries[0].content, fullList.documents[0].content);
+
+    const indexList = await worker.fetch(request("/v3/documents/list", {
+      containerTag: "projection-space",
+      projection: "index",
+    }), env, { waitUntil() {} }).then((response) => response.json());
+    assert.equal(indexList.documents[0].id, id);
+    assert.match(indexList.documents[0].summary, /Projection needle/);
+    assert.equal("content" in indexList.documents[0], false);
+    assert.equal("enrichment" in indexList.documents[0], false);
+    assert.equal("memoryEntries" in indexList, false);
+
+    const idsList = await worker.fetch(request("/v3/documents/list", {
+      containerTag: "projection-space",
+      projection: "ids",
+    }), env, { waitUntil() {} }).then((response) => response.json());
+    assert.deepEqual(idsList.documents, [{ id }]);
+    assert.equal("memoryEntries" in idsList, false);
+
+    const captureList = await worker.fetch(request("/v3/documents/list", {
+      containerTag: "projection-space",
+      projection: "capture",
+    }), env, { waitUntil() {} }).then((response) => response.json());
+    assert.deepEqual(captureList.documents, [{ id, metadata }]);
+    assert.equal("memoryEntries" in captureList, false);
+
+    const invalidProjection = await worker.fetch(request("/v3/documents/list", {
+      projection: "unknown",
+    }), env, { waitUntil() {} });
+    assert.equal(invalidProjection.status, 400);
+    const invalidIndexOnly = await worker.fetch(request("/v4/search", {
+      containerTag: "projection-space",
+      indexOnly: "yes",
+    }), env, { waitUntil() {} });
+    assert.equal(invalidIndexOnly.status, 400);
+
+    const legacyContent = `${"old prefix ".repeat(700)}\n# Tail heading\nTailNeedle appears near the end.`;
+    const legacy = await worker.fetch(request("/v3/documents", {
+      containerTag: "legacy-summary-space",
+      customId: "legacy-tail",
+      content: legacyContent,
+    }), env, { waitUntil() {} }).then((response) => response.json());
+    const legacySearch = await worker.fetch(request("/v4/search", {
+      containerTag: "legacy-summary-space",
+      q: "TailNeedle",
+      indexOnly: true,
+    }), env, { waitUntil() {} }).then((response) => response.json());
+    assert.equal(legacySearch.results[0].id, legacy.id);
+    assert.equal("content" in legacySearch.results[0], false);
+    assert.equal("memory" in legacySearch.results[0], false);
+    assert.match(legacySearch.results[0].summary, /# Tail heading\nTailNeedle/);
+    assert.ok(legacySearch.results[0].summary.length <= 4_002);
+  } finally {
+    database.close();
+  }
+});
+
+test("FTS score preserves stronger-first order and indexOnly excludes body-only v1 crowding", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    let ftsPages = 0;
+    let instrPages = 0;
+    DB.interceptAll((sql, rows) => {
+      if (sql.includes("FROM memories_fts")) ftsPages += 1;
+      if (sql.includes("instr(lower(content)")) instrPages += 1;
+      return rows;
+    });
+    const env = baseEnvironment(DB);
+    const ctx = { waitUntil() {} };
+    const stronger = await worker.fetch(request("/v3/documents", {
+      containerTag: "bm25-order",
+      customId: "stronger",
+      content: "RankNeedle ".repeat(30),
+    }), env, ctx).then((response) => response.json());
+    const weaker = await worker.fetch(request("/v3/documents", {
+      containerTag: "bm25-order",
+      customId: "weaker",
+      content: `RankNeedle ${"unrelated padding ".repeat(200)}`,
+    }), env, ctx).then((response) => response.json());
+    const ranked = await worker.fetch(request("/v4/search", {
+      containerTag: "bm25-order",
+      q: "RankNeedle",
+      limit: 5,
+    }), env, ctx).then((response) => response.json());
+    assert.deepEqual(ranked.results.map(({ id }) => id), [stronger.id, weaker.id]);
+    assert.ok(ranked.results[0].similarity > ranked.results[1].similarity);
+    assert.ok(ranked.results.every(({ similarity }) => similarity < 0.61));
+    assert.deepEqual(ranked.results.map(({ lexicalSimilarity }) => lexicalSimilarity),
+      ranked.results.map(({ similarity }) => similarity));
+    assert.equal(ranked.results[0].semanticSimilarity, null);
+
+    const unrelatedIndex = (title) => ({
+      version: 1,
+      title,
+      description: "別件の索引",
+      sections: ["別件"],
+      recallable: true,
+      sourceKind: "conversation",
+    });
+    for (let index = 0; index < 70; index += 1) {
+      await worker.fetch(request("/v3/documents", {
+        containerTag: "index-crowding",
+        customId: `body-only-${index}`,
+        content: `${"CrowdingNeedle ".repeat(20)}本文だけの候補 ${index}`,
+        metadata: { memoryIndex: unrelatedIndex(`無関係 ${index}`) },
+      }), env, ctx);
+    }
+    const indexed = await worker.fetch(request("/v3/documents", {
+      containerTag: "index-crowding",
+      customId: "indexed",
+      content: `CrowdingNeedle 索引にも一致する候補 ${"padding ".repeat(100)}`,
+      metadata: { memoryIndex: unrelatedIndex("CrowdingNeedle の索引") },
+    }), env, ctx).then((response) => response.json());
+    const topic = await worker.fetch(request("/v3/documents", {
+      containerTag: "index-crowding",
+      customId: "topic",
+      content: `CrowdingNeedle topicにも一致する候補 ${"padding ".repeat(100)}`,
+      metadata: {
+        memoryIndex: unrelatedIndex("別名の索引"),
+        topics: ["CrowdingNeedle topic"],
+      },
+    }), env, ctx).then((response) => response.json());
+    ftsPages = 0;
+    const compact = await worker.fetch(request("/v4/search", {
+      containerTag: "index-crowding",
+      q: "CrowdingNeedle",
+      limit: 20,
+      indexOnly: true,
+    }), env, ctx).then((response) => response.json());
+    assert.deepEqual(new Set(compact.results.map(({ id }) => id)), new Set([indexed.id, topic.id]));
+    assert.ok(compact.results.every((result) => !("content" in result) && !("memory" in result)));
+    assert.ok(ftsPages >= 2, "body-only rows should be paged past before applying the candidate limit");
+
+    const ecole = await worker.fetch(request("/v3/documents", {
+      containerTag: "unicode-index",
+      customId: "ecole",
+      content: "école lexical body",
+      metadata: { memoryIndex: unrelatedIndex("ÉCOLE deployment") },
+    }), env, ctx).then((response) => response.json());
+    const athens = await worker.fetch(request("/v3/documents", {
+      containerTag: "unicode-index",
+      customId: "athens",
+      content: "αθήνα lexical body",
+      metadata: {
+        memoryIndex: unrelatedIndex("別名の索引"),
+        topics: ["ΑΘΉΝΑ"],
+      },
+    }), env, ctx).then((response) => response.json());
+    const ecoleSearch = await worker.fetch(request("/v4/search", {
+      containerTag: "unicode-index",
+      q: "école",
+      indexOnly: true,
+    }), env, ctx).then((response) => response.json());
+    const athensSearch = await worker.fetch(request("/v4/search", {
+      containerTag: "unicode-index",
+      q: "αθήνα",
+      indexOnly: true,
+    }), env, ctx).then((response) => response.json());
+    assert.deepEqual(ecoleSearch.results.map(({ id }) => id), [ecole.id]);
+    assert.deepEqual(athensSearch.results.map(({ id }) => id), [athens.id]);
+
+    const fullwidthTarget = await worker.fetch(request("/v3/documents", {
+      containerTag: "fts-instr-fallback",
+      customId: "fullwidth-target",
+      content: "ＡＢＣ の設定",
+      metadata: { memoryIndex: unrelatedIndex("ＡＢＣ の設定") },
+    }), env, ctx).then((response) => response.json());
+    await worker.fetch(request("/v3/documents", {
+      containerTag: "fts-instr-fallback",
+      customId: "ascii-body-only",
+      content: "ABC の unrelated body",
+      metadata: { memoryIndex: unrelatedIndex("別件の索引") },
+    }), env, ctx);
+    ftsPages = 0;
+    instrPages = 0;
+    const fullwidthSearch = await worker.fetch(request("/v4/search", {
+      containerTag: "fts-instr-fallback",
+      q: "ＡＢＣ",
+      indexOnly: true,
+    }), env, ctx).then((response) => response.json());
+    assert.deepEqual(fullwidthSearch.results.map(({ id }) => id), [fullwidthTarget.id]);
+    assert.equal(fullwidthSearch.results[0].lexicalSimilarity, 0);
+    assert.equal(fullwidthSearch.results[0].similarity, 0);
+    assert.ok(ftsPages > 0, "normalized FTS should observe the ASCII body-only distractor");
+    assert.ok(instrPages > 0, "zero accepted FTS rows should fall back to exact instr matching");
+  } finally {
+    database.close();
+  }
+});
+
+test("indexOnly SQL projects v1 content away across recent, lexical, semantic, and vector hydration paths", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    let selected = [];
+    DB.interceptAll((sql, rows) => {
+      if (sql.includes("THEN '' ELSE") && sql.includes("AS content")) {
+        selected.push({ sql, rows: rows.map((row) => ({ id: row.id, content: row.content })) });
+      }
+      return rows;
+    });
+    const plainEnv = baseEnvironment(DB);
+    const ctx = { waitUntil() {} };
+    const v1Content = "FtsNeedle Qz v1 private body";
+    const legacyContent = "FtsNeedle Qz legacy body retained for summary";
+    const v1 = await worker.fetch(request("/v3/documents", {
+      containerTag: "content-projection",
+      customId: "v1",
+      content: v1Content,
+      metadata: {
+        memoryIndex: {
+          version: 1,
+          title: "FtsNeedle Qz index",
+          description: "projection path",
+          sections: [],
+          recallable: true,
+          sourceKind: "conversation",
+        },
+      },
+    }), plainEnv, ctx).then((response) => response.json());
+    const legacy = await worker.fetch(request("/v3/documents", {
+      containerTag: "content-projection",
+      customId: "legacy",
+      content: legacyContent,
+    }), plainEnv, ctx).then((response) => response.json());
+    const booleanVersionContent = "FtsNeedle Qz boolean version remains legacy";
+    const booleanVersion = await worker.fetch(request("/v3/documents", {
+      containerTag: "content-projection",
+      customId: "boolean-version",
+      content: booleanVersionContent,
+      metadata: { memoryIndex: { version: true, title: "FtsNeedle Qz boolean" } },
+    }), plainEnv, ctx).then((response) => response.json());
+    const unknownVersionContent = "FtsNeedle Qz unknown version remains legacy";
+    const unknownVersion = await worker.fetch(request("/v3/documents", {
+      containerTag: "content-projection",
+      customId: "unknown-version",
+      content: unknownVersionContent,
+      metadata: { memoryIndex: { version: "future", title: "FtsNeedle Qz unknown" } },
+    }), plainEnv, ctx).then((response) => response.json());
+
+    const assertProjection = (record) => {
+      assert.ok(record, "expected an indexOnly content projection query");
+      assert.equal(record.rows.find((row) => row.id === v1.id)?.content, "");
+      assert.equal(record.rows.find((row) => row.id === legacy.id)?.content, legacyContent);
+      assert.equal(record.rows.find((row) => row.id === booleanVersion.id)?.content, booleanVersionContent);
+      assert.equal(record.rows.find((row) => row.id === unknownVersion.id)?.content, unknownVersionContent);
+    };
+
+    selected = [];
+    await worker.fetch(request("/v4/search", {
+      containerTag: "content-projection",
+      q: "",
+      indexOnly: true,
+      limit: 10,
+    }), plainEnv, ctx);
+    assertProjection(selected.find(({ sql }) => sql.includes("ORDER BY updated_at DESC LIMIT ?")));
+
+    selected = [];
+    const lexicalProjection = await worker.fetch(request("/v4/search", {
+      containerTag: "content-projection",
+      q: "FtsNeedle",
+      indexOnly: true,
+      limit: 10,
+    }), plainEnv, ctx).then((response) => response.json());
+    assertProjection(selected.find(({ sql }) => sql.includes("FROM memories_fts")));
+    assert.match(lexicalProjection.results.find(({ id }) => id === booleanVersion.id)?.summary ?? "", /boolean version/);
+    assert.match(lexicalProjection.results.find(({ id }) => id === unknownVersion.id)?.summary ?? "", /unknown version/);
+
+    selected = [];
+    await worker.fetch(request("/v4/search", {
+      containerTag: "content-projection",
+      q: "Qz",
+      indexOnly: true,
+      limit: 10,
+    }), plainEnv, ctx);
+    assertProjection(selected.find(({ sql }) => sql.includes("instr(lower(content)")));
+
+    for (const id of [v1.id, legacy.id, booleanVersion.id, unknownVersion.id]) {
+      database.prepare(
+        "UPDATE memories SET embedding_json = ?, embedding_status = 'done', vector_status = 'failed' WHERE id = ?",
+      ).run(JSON.stringify(embedding(1, 0)), id);
+    }
+    const semanticEnv = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: { run: async () => ({ data: [embedding(1, 0)] }) },
+      MEMORY_VECTORS: { query: async () => ({ matches: [], count: 0 }) },
+    });
+    selected = [];
+    const semantic = await worker.fetch(request("/v4/search", {
+      containerTag: "content-projection",
+      q: "MeaningNeedle",
+      indexOnly: true,
+      limit: 10,
+    }), semanticEnv, ctx).then((response) => response.json());
+    assertProjection(selected.find(({ sql }) => sql.includes("vector_status <> 'indexed'")));
+    assert.ok(semantic.results.every((result) => result.semanticSimilarity === 1));
+
+    const revisions = new Map(database.prepare(
+      "SELECT id, topic_revision FROM memories WHERE id IN (?, ?, ?, ?)",
+    ).all(v1.id, legacy.id, booleanVersion.id, unknownVersion.id).map((row) => [row.id, row.topic_revision]));
+    database.prepare("UPDATE memories SET vector_status = 'indexed' WHERE id IN (?, ?, ?, ?)")
+      .run(v1.id, legacy.id, booleanVersion.id, unknownVersion.id);
+    const vectorEnv = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: { run: async () => ({ data: [embedding(1, 0)] }) },
+      MEMORY_VECTORS: {
+        query: async () => ({
+          matches: [v1.id, legacy.id, booleanVersion.id, unknownVersion.id].map((id) => ({
+            id,
+            score: 0.9,
+            metadata: { topic_revision: revisions.get(id) },
+          })),
+          count: 4,
+        }),
+      },
+    });
+    selected = [];
+    await worker.fetch(request("/v4/search", {
+      containerTag: "content-projection",
+      q: "VectorNeedle",
+      indexOnly: true,
+      limit: 10,
+    }), vectorEnv, ctx);
+    assertProjection(selected.find(({ sql }) => sql.includes("id IN (") && sql.includes("embedding_json")));
+  } finally {
+    database.close();
+  }
+});
+
+test("enrichment-eligible list skips newer recallable-false rows and advances to older targets", async () => {
+  const database = openDatabase();
+  try {
+    const env = baseEnvironment(d1Adapter(database));
+    const ctx = { waitUntil() {} };
+    const eligible = await worker.fetch(request("/v3/documents", {
+      containerTag: "classification-space",
+      customId: "eligible",
+      content: "Older enrichment target.",
+    }), env, ctx).then((response) => response.json());
+    const excluded = await worker.fetch(request("/v3/documents", {
+      containerTag: "classification-space",
+      customId: "excluded",
+      content: "Newer manual-only target.",
+      metadata: { memoryIndex: { version: 1, title: "Manual only", recallable: false } },
+    }), env, ctx).then((response) => response.json());
+    database.prepare("UPDATE memories SET created_at = ?, updated_at = ? WHERE id = ?")
+      .run("2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", eligible.id);
+    database.prepare("UPDATE memories SET created_at = ?, updated_at = ? WHERE id = ?")
+      .run("2026-02-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z", excluded.id);
+
+    const ordinary = await worker.fetch(request("/v3/documents/list", {
+      containerTag: "classification-space",
+      topic: "__unclassified__",
+      projection: "ids",
+      page: 1,
+      limit: 1,
+    }), env, ctx).then((response) => response.json());
+    assert.deepEqual(ordinary.documents, [{ id: excluded.id }]);
+    assert.equal(ordinary.pagination.totalItems, 2);
+
+    const eligibleOnly = await worker.fetch(request("/v3/documents/list", {
+      containerTag: "classification-space",
+      topic: "__unclassified__",
+      projection: "ids",
+      enrichmentEligible: true,
+      page: 1,
+      limit: 1,
+    }), env, ctx).then((response) => response.json());
+    assert.deepEqual(eligibleOnly.documents, [{ id: eligible.id }]);
+    assert.equal(eligibleOnly.pagination.totalItems, 1);
+  } finally {
+    database.close();
+  }
+});
+
+test("semantic fallback scans only unindexed rows after Vectorize succeeds and all rows when it fails", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const baseEnv = baseEnvironment(DB);
+    const ctx = { waitUntil() {} };
+    const ids = {};
+    for (const [customId, content] of [["indexed", "Archived alpha."], ["failed", "Archived beta."]]) {
+      const response = await worker.fetch(request("/v3/documents", {
+        containerTag: "fallback-space",
+        customId,
+        content,
+      }), baseEnv, ctx);
+      ids[customId] = (await response.json()).id;
+      database.prepare(
+        "UPDATE memories SET embedding_json = ?, embedding_status = 'done', vector_status = ? WHERE id = ?",
+      ).run(JSON.stringify(embedding(1, 0)), customId, ids[customId]);
+    }
+
+    let failVectorQuery = false;
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: { run: async () => ({ data: [embedding(1, 0)] }) },
+      MEMORY_VECTORS: {
+        query: async () => {
+          if (failVectorQuery) throw new Error("Vectorize unavailable");
+          return { matches: [], count: 0 };
+        },
+      },
+    });
+    const successfulVectorize = await worker.fetch(request("/v4/search", {
+      containerTag: "fallback-space",
+      q: "semantic needle",
+    }), env, ctx).then((response) => response.json());
+    assert.deepEqual(successfulVectorize.results.map((result) => result.id), [ids.failed]);
+
+    failVectorQuery = true;
+    const failedVectorize = await worker.fetch(request("/v4/search", {
+      containerTag: "fallback-space",
+      q: "semantic needle",
+    }), env, ctx).then((response) => response.json());
+    assert.deepEqual(new Set(failedVectorize.results.map((result) => result.id)), new Set([ids.indexed, ids.failed]));
+  } finally {
+    database.close();
+  }
+});
+
+test("scope search D1 fallback retains indexed rows when other scopes occupy Vectorize matches", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const baseEnv = baseEnvironment(DB);
+    const ctx = { waitUntil() {} };
+    const target = await worker.fetch(request("/v3/documents", {
+      containerTag: "scope-space",
+      customId: "target-scope",
+      content: "Archived alpha.",
+      metadata: { sm_scope: "target" },
+    }), baseEnv, ctx).then((response) => response.json());
+    const foreign = await worker.fetch(request("/v3/documents", {
+      containerTag: "scope-space",
+      customId: "foreign-scope",
+      content: "Archived beta.",
+      metadata: { sm_scope: "foreign" },
+    }), baseEnv, ctx).then((response) => response.json());
+    for (const id of [target.id, foreign.id]) {
+      database.prepare(
+        "UPDATE memories SET embedding_json = ?, embedding_status = 'done', vector_status = 'indexed' WHERE id = ?",
+      ).run(JSON.stringify(embedding(1, 0)), id);
+    }
+    const foreignRevision = database.prepare(
+      "SELECT topic_revision FROM memories WHERE id = ?",
+    ).get(foreign.id).topic_revision;
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: { run: async () => ({ data: [embedding(1, 0)] }) },
+      MEMORY_VECTORS: {
+        query: async () => ({
+          matches: [{ id: foreign.id, score: 0.99, metadata: { topic_revision: foreignRevision } }],
+          count: 1,
+        }),
+      },
+    });
+    const search = await worker.fetch(request("/v4/search", {
+      containerTag: "scope-space",
+      q: "semantic needle",
+      filters: {
+        AND: [{ key: "sm_scope", filterType: "metadata", value: "target" }],
+      },
+    }), env, ctx).then((response) => response.json());
+    assert.deepEqual(search.results.map((result) => result.id), [target.id]);
+    assert.equal(search.results[0].similarity, 0.99);
+  } finally {
+    database.close();
+  }
+});
+
+test("Vectorize hits are hydrated even when the speculative D1 fallback query fails", async () => {
+  const database = openDatabase();
+  try {
+    const baseDB = d1Adapter(database);
+    const response = await worker.fetch(request("/v3/documents", {
+      containerTag: "fallback-error",
+      customId: "vector-hit",
+      content: "Stored without lexical query terms.",
+    }), baseEnvironment(baseDB), { waitUntil() {} });
+    const { id } = await response.json();
+    database.prepare(
+      "UPDATE memories SET embedding_json = ?, embedding_status = 'done', vector_status = 'indexed' WHERE id = ?",
+    ).run(JSON.stringify(embedding(1, 0)), id);
+    const revision = database.prepare("SELECT topic_revision FROM memories WHERE id = ?").get(id).topic_revision;
+    let fallbackFailed = false;
+    const DB = {
+      ...baseDB,
+      prepare(sql) {
+        if (sql.includes("vector_status <> 'indexed'")) {
+          return {
+            bind() { return this; },
+            async all() {
+              fallbackFailed = true;
+              throw new Error("D1 fallback unavailable");
+            },
+          };
+        }
+        return baseDB.prepare(sql);
+      },
+    };
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: { run: async () => ({ data: [embedding(1, 0)] }) },
+      MEMORY_VECTORS: {
+        query: async () => ({
+          matches: [{ id, score: 0.98, metadata: { topic_revision: revision } }],
+          count: 1,
+        }),
+      },
+    });
+    const search = await worker.fetch(request("/v4/search", {
+      containerTag: "fallback-error",
+      q: "semantic needle",
+    }), env, { waitUntil() {} }).then((result) => result.json());
+    assert.equal(fallbackFailed, true);
+    assert.equal(search.results[0].id, id);
+    assert.equal(search.results[0].similarity, 0.98);
+  } finally {
+    database.close();
+  }
+});
+
+test("recallable false preserves storage, explicit topics, and manual search without enrichment", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    let aiCalls = 0;
+    let vectorCalls = 0;
+    const waits = [];
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: { run: async () => { aiCalls += 1; return { data: [embedding()] }; } },
+      MEMORY_VECTORS: {
+        getByIds: async () => { vectorCalls += 1; return []; },
+        upsert: async () => { vectorCalls += 1; return { mutationId: "unexpected" }; },
+      },
+    });
+    const ctx = { waitUntil: (promise) => waits.push(promise) };
+    const metadata = {
+      memoryIndex: { version: 1, title: "Manual memory", recallable: false },
+      topics: ["Manual topic"],
+    };
+    const first = await worker.fetch(request("/v3/documents", {
+      containerTag: "manual-space",
+      customId: "manual-document",
+      content: "Manual searchable first version.",
+      metadata,
+    }), env, ctx);
+    const firstBody = await first.json();
+    assert.equal(firstBody.enrichmentStatus, "disabled");
+    assert.equal(firstBody.topicStatus, "done");
+    assert.deepEqual(firstBody.topics, ["Manual topic"]);
+
+    const second = await worker.fetch(request("/v3/documents", {
+      containerTag: "manual-space",
+      customId: "manual-document",
+      content: "Manual searchable second version.",
+      metadata,
+    }), env, ctx);
+    const secondBody = await second.json();
+    assert.equal(secondBody.id, firstBody.id);
+    assert.equal(secondBody.enrichmentStatus, "disabled");
+    assert.equal(waits.length, 0);
+    assert.equal(aiCalls, 0);
+
+    const stored = await worker.fetch(new Request(
+      `https://memory.example/v3/documents/${firstBody.id}`,
+      { headers: { Authorization: "Bearer test-key" } },
+    ), env, ctx).then((response) => response.json());
+    assert.deepEqual(stored.topics, ["Manual topic"]);
+    assert.deepEqual(
+      {
+        embeddingStatus: stored.enrichment.embeddingStatus,
+        factStatus: stored.enrichment.factStatus,
+        vectorStatus: stored.enrichment.vectorStatus,
+        topicStatus: stored.enrichment.topicStatus,
+      },
+      { embeddingStatus: "disabled", factStatus: "disabled", vectorStatus: "disabled", topicStatus: "done" },
+    );
+
+    const patched = await worker.fetch(request(`/v3/documents/${firstBody.id}`, {
+      content: "Patched manual keyword.",
+    }, "PATCH"), env, ctx).then((response) => response.json());
+    assert.equal(patched.enrichment.embeddingStatus, "disabled");
+    assert.equal(patched.enrichment.factStatus, "disabled");
+    assert.equal(patched.enrichment.vectorStatus, "disabled");
+    assert.equal(patched.enrichment.topicStatus, "disabled");
+    assert.equal(waits.length, 0);
+    assert.equal(aiCalls, 0);
+
+    const retry = await worker.fetch(request("/v4/enrich", { id: firstBody.id }), env, ctx);
+    assert.equal(retry.status, 409);
+    assert.match((await retry.json()).error.message, /excluded/);
+    assert.equal(waits.length, 0);
+    assert.equal(aiCalls, 0);
+
+    database.prepare(
+      "UPDATE memories SET embedding_json = ?, vector_status = 'failed' WHERE id = ?",
+    ).run(JSON.stringify(embedding()), firstBody.id);
+    const scheduledWaits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => scheduledWaits.push(promise) });
+    await Promise.all(scheduledWaits);
+    assert.equal(vectorCalls, 0);
+
+    const manualSearch = await worker.fetch(request("/v4/search", {
+      containerTag: "manual-space",
+      q: "Patched manual keyword",
+    }), { ...env, AI_ENRICHMENT_MODE: "off" }, ctx).then((response) => response.json());
+    assert.equal(manualSearch.results[0].id, firstBody.id);
+    assert.match(manualSearch.results[0].content, /Patched manual keyword/);
+    assert.equal(typeof manualSearch.results[0].lexicalSimilarity, "number");
+    assert.equal(manualSearch.results[0].semanticSimilarity, null);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM facts").get().count, 0);
+  } finally {
+    database.close();
   }
 });
