@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { api, loadConfig, getProjectContext, listJsonlFiles, readSessionMeta,
   chooseCandidates, parseTaskTranscript, readTaskTitles, buildTurnDocuments, sanitizeText } from "./Import-CodexSupermemoryHistory.mjs";
@@ -33,44 +32,19 @@ function readReceipts(statePath) {
   return new Set(state);
 }
 
-async function acquireReceiptLock(statePath, timeoutMs = 10_000) {
-  const lockPath = `${statePath}.lock`;
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    let descriptor;
-    try {
-      descriptor = openSync(lockPath, "wx");
-      writeFileSync(descriptor, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }), "utf8");
-      return () => {
-        try { closeSync(descriptor); } finally {
-          try { unlinkSync(lockPath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
-        }
-      };
-    } catch (error) {
-      if (descriptor !== undefined) {
-        try { closeSync(descriptor); } catch { /* best-effort cleanup */ }
-        try { unlinkSync(lockPath); } catch (cleanupError) { if (cleanupError?.code !== "ENOENT") throw cleanupError; }
-      }
-      if (error?.code !== "EEXIST") throw error;
-      // 終了したhookの孤児ロックだけを除去する。通常の保存はこの閾値より十分短い。
-      try {
-        if (Date.now() - statSync(lockPath).mtimeMs > 5 * 60_000) {
-          unlinkSync(lockPath);
-          continue;
-        }
-      } catch (lockError) {
-        if (lockError?.code === "ENOENT") continue;
-        throw lockError;
-      }
-      if (Date.now() >= deadline) throw new Error("Timed out while updating capture receipts.");
-      await delay(20);
-    }
-  }
-}
-
 async function recordReceipt(statePath, customId) {
-  const release = await acquireReceiptLock(statePath);
+  // Node 24標準SQLiteを保存処理の短い排他だけに使い、送信済み記録の正本は既存JSONのまま保つ。
+  const { DatabaseSync } = await import("node:sqlite");
+  const databasePath = join(dirname(statePath), "capture-coordination.sqlite3");
+  const database = new DatabaseSync(databasePath);
+  let transactionOpen = false;
   try {
+    database.exec("PRAGMA busy_timeout = 10000");
+    database.exec("CREATE TABLE IF NOT EXISTS capture_mutex (id INTEGER PRIMARY KEY CHECK (id = 1), touched_at INTEGER NOT NULL)");
+    database.exec("INSERT OR IGNORE INTO capture_mutex (id, touched_at) VALUES (1, 0)");
+    database.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    database.prepare("UPDATE capture_mutex SET touched_at = ? WHERE id = 1").run(Date.now());
     const receipts = readReceipts(statePath);
     receipts.add(customId);
     const temporary = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -81,8 +55,13 @@ async function recordReceipt(statePath, customId) {
       try { unlinkSync(temporary); } catch (cleanupError) { if (cleanupError?.code !== "ENOENT") throw cleanupError; }
       throw error;
     }
+    database.exec("COMMIT");
+    transactionOpen = false;
   } finally {
-    release();
+    if (transactionOpen) {
+      try { database.exec("ROLLBACK"); } catch { /* 元の保存エラーを優先する。 */ }
+    }
+    database.close();
   }
 }
 

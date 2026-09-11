@@ -44,7 +44,7 @@ Keep the local Wrangler configuration for future updates. Never commit generated
 - Manual `add_memory` and project-scoped lists use a single workspace root advertised by the MCP client. If unavailable, pass an absolute `sourceFolder` or an explicit `containerTag`; the plugin never treats its installation folder as the user's project.
 - Prompt recall searches every discovered nonempty space by topic. The initial session event does not inject unrelated recent records.
 - Automatic context contains a title, description, section names, timestamps, and document IDs. Codex opens full records with `getDocument` when needed.
-- Capture preserves existing v2 IDs and sent-document receipts, redacts configured secrets, and retries unacknowledged records.
+- Capture preserves existing v2 IDs and JSON sent-document receipts, serializes receipt updates through Node's built-in SQLite, redacts configured secrets, and retries unacknowledged records. The small coordination database stays under `cloudflare-memory/capture-state/` in the selected Codex home.
 - Space discovery is capped by the current server API at 100. A full page is reported as incomplete rather than claiming exhaustive search.
 
 The API key grants access to the records in one server installation. Use separate installations for separate trust boundaries. Redaction reduces accidental secret capture; review what you choose to store in your own backend.

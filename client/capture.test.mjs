@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanUserRequest, parseTaskTranscript, buildTurnDocuments, readSessionMeta, getProjectContext } from "./Import-CodexSupermemoryHistory.mjs";
@@ -190,6 +191,25 @@ test("同じタスクの保存が並行してもv2レシートを失わず次回
   const retry = await capture(f.payload, { ...f.options, send: async () => { retried++; return { id: "unexpected" }; } });
   assert.deepEqual(retry, { saved: 0, pending: 0, completedTurns: 2 });
   assert.equal(retried, 0);
+});
+
+test("レシート更新失敗でもSQLite transactionを解放して次回再試行できる", async (t) => {
+  const f = fixture(t, [user("依頼"), assistant("結果")]);
+  const project = getProjectContext(f.home);
+  const stateDirectory = join(f.home, "cloudflare-memory", "capture-state");
+  const stateId = createHash("sha256").update(`${f.options.config.baseUrl}:${project.containerTag}:${f.meta.id}`).digest("hex");
+  const statePath = join(stateDirectory, `${stateId}.json`);
+  await assert.rejects(capture(f.payload, { ...f.options, send: async (document) => {
+    mkdirSync(stateDirectory, { recursive: true });
+    writeFileSync(statePath, "{invalid", "utf8");
+    return { id: document.customId };
+  } }), /JSON/);
+  const databasePath = join(stateDirectory, "capture-coordination.sqlite3");
+  assert.equal(existsSync(databasePath), true);
+  assert.equal(existsSync(`${statePath}.lock`), false);
+  writeFileSync(statePath, "[]", "utf8");
+  const retry = await capture(f.payload, { ...f.options, send: async (document) => ({ id: document.customId }) });
+  assert.deepEqual(retry, { saved: 1, pending: 0, completedTurns: 1 });
 });
 
 test("古い日付の継続タスクを探索し、別タスクの明示パスを拒否する", async (t) => {
