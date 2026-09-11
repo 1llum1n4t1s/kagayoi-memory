@@ -40,15 +40,15 @@ Keep the local Wrangler configuration for future updates. Never commit generated
 
 ## Memory behavior
 
-- Completed user requests and final answers are saved in the shared `memories` collection with deterministic IDs and source-folder provenance.
-- Use `listTopics` to find content categories, then pass a `topic` to `listDocuments` or `listMemories`. Lists include records across both legacy folder spaces and the shared collection. Use `topic: "__unclassified__"` to see records awaiting classification.
+- Completed user requests and final answers are saved in the shared `memories` collection with source-folder provenance. A deterministic capture identity makes retries reuse the same stored record instead of creating duplicates.
+- Use `listTopics` to find content categories, then pass a `topic` to `listDocuments` or `listMemories`. Lists include records across both legacy folder spaces and the shared collection. Use `topic: "__unclassified__"` to see records without current topic labels, including records whose classification failed, is disabled, or was deliberately skipped.
 - Manual `add_memory` saves to the shared collection. To forget a record after reading it, pass its `documentId` and source `containerTag`; exact stored content remains supported for compatibility. An absolute `sourceFolder` or a single workspace root supplied by the MCP client adds provenance; an explicit `containerTag` overrides storage. The plugin never uses its installation folder as the user's project. `listSpaces` exposes physical spaces for compatibility and diagnostics.
 - Prompt recall searches every discovered nonempty space by topic. The initial session event does not inject unrelated recent records.
 - Automatic context contains a title, description, section names, timestamps, and document IDs. Codex opens full records with `getDocument` when needed.
 - Capture redacts configured secrets and retries unacknowledged records. Local capture state stays under `cloudflare-memory/capture-state/` in the selected Codex home.
 - Space discovery is capped by the current server API at 100. A full page is reported as incomplete rather than claiming exhaustive search.
 
-Topics are derived from record content during the existing Workers AI enrichment step. Classification is asynchronous; with AI enrichment disabled or failed, records remain accessible through the unclassified list. Folder names are retained as source metadata. Existing records keep their original document IDs and storage locations and appear in the same topic browser.
+Topics are derived from record content during the existing Workers AI enrichment step. Classification is asynchronous. Brief acknowledgements without a substantial result, and similar low-information records, remain available to manual search but are excluded from automatic recall and enrichment; explicit topic labels are still retained. Folder names are retained as source metadata. Existing records keep their original document IDs and storage locations and appear in the same topic browser.
 
 Update the server and apply its migrations before installing a client that uses topic browsing. To classify old records, preview a bounded batch using the existing memory connection:
 
