@@ -1,0 +1,33 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "cloudflare-supermemory",
+  "version": "0.1.0",
+  "description": "Self-hosted, topic-based memory for Codex on Cloudflare",
+  "author": {
+    "name": "Kagayoi",
+    "url": "https://github.com/1llum1n4t1s"
+  },
+  "repository": "https://github.com/1llum1n4t1s/cloudflare-supermemory",
+  "license": "MIT",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Cloudflare Supermemory",
+        "shortDescription": "Recall relevant work across projects from your own Cloudflare server.",
+        "longDescription": "Save completed Codex work to a self-hosted Cloudflare Worker, recall concise indexes by topic across project folders, and open source records only when details are needed.",
+        "developerName": "Kagayoi",
+        "category": "Developer Tools",
+        "capabilities": [
+          "Read",
+          "Write"
+        ],
+        "defaultPrompt": [
+          "Set up my self-hosted memory connection.",
+          "Search my memory for a previous implementation.",
+          "Show the current memory connection status."
+        ]
+      },
+      "hooks": "./hooks/hooks.json"
+    }
+  }
+}

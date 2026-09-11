@@ -1,0 +1,4 @@
+interface:
+  display_name: "Setup Cloudflare Memory"
+  short_description: "Connect Codex to your self-hosted memory server"
+  default_prompt: "Set up or verify my self-hosted Cloudflare memory connection."

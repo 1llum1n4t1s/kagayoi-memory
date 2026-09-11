@@ -1,0 +1,20 @@
+{
+  "name": "@cloudflare-supermemory/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "check": "pnpm build && pnpm test",
+    "deploy": "wrangler deploy --minify",
+    "migrate:local": "wrangler d1 migrations apply cloudflare-supermemory --local",
+    "migrate:remote": "wrangler d1 migrations apply cloudflare-supermemory --remote",
+    "test": "node --experimental-transform-types --test tests/auth.test.mjs && node tests/smoke.mjs",
+    "test:live": "node tests/live-smoke.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260901.1",
+    "typescript": "^7.0.2",
+    "wrangler": "4.127.1"
+  }
+}

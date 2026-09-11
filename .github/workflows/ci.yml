@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+          cache-dependency-path: server/pnpm-lock.yaml
+
+      - name: Install server dependencies from lockfile
+        run: pnpm -C server install --frozen-lockfile
+
+      - name: Test client
+        run: pnpm run test:client
+
+      - name: Test setup and packaging scripts
+        run: pnpm run test:scripts
+
+      - name: Test and type-check server
+        run: pnpm -C server check
+
+      - name: Validate source plugin
+        run: pnpm run validate:plugin
+
+      - name: Build and validate distributable plugin
+        run: pnpm run package:plugin
+
+      - name: Create plugin archive
+        run: tar -czf dist/cloudflare-supermemory.tar.gz -C dist cloudflare-supermemory
+
+      - name: Upload plugin archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflare-supermemory
+          path: dist/cloudflare-supermemory.tar.gz
+          if-no-files-found: error

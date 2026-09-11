@@ -1,0 +1,19 @@
+{
+  "name": "cloudflare-supermemory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.4.0",
+  "engines": {
+    "node": ">=24.18.0"
+  },
+  "scripts": {
+    "test": "pnpm run test:client && pnpm run test:scripts && pnpm run test:server",
+    "test:client": "node --test client/*.test.mjs",
+    "test:scripts": "node --test scripts/*.test.mjs",
+    "test:server": "pnpm -C server test",
+    "validate:plugin": "node scripts/validate-plugin.mjs",
+    "package:plugin": "node scripts/package-plugin.mjs && node scripts/validate-plugin.mjs dist/cloudflare-supermemory",
+    "check": "pnpm run test && pnpm run validate:plugin && pnpm run package:plugin && pnpm -C server build"
+  }
+}

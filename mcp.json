@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "cloudflare_supermemory": {
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/mcp-launcher.mjs"
+      ],
+      "type": "stdio"
+    }
+  },
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
+}

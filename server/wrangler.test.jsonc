@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-supermemory-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-02",
+  "vars": { "AI_ENRICHMENT_MODE": "off" },
+  "ai": { "binding": "AI" },
+  "vectorize": [
+    { "binding": "MEMORY_VECTORS", "index_name": "cloudflare-supermemory-test" }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cloudflare-supermemory",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

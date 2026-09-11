@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-supermemory",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-02",
+  "workers_dev": true,
+  "preview_urls": false,
+  "triggers": { "crons": ["*/15 * * * *"] },
+  "vars": { "AI_ENRICHMENT_MODE": "on" },
+  "ai": { "binding": "AI" },
+  "vectorize": [
+    { "binding": "MEMORY_VECTORS", "index_name": "replace-with-your-vectorize-index" }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cloudflare-supermemory",
+      "database_id": "replace-with-your-d1-database-id",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": { "enabled": true, "logs": { "enabled": true, "head_sampling_rate": 1 } }
+}

@@ -1,0 +1,12 @@
+node_modules/
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+.wrangler/
+.wrangler-test/
+dist/
+*.log
+*.cpuprofile
+server/wrangler.jsonc
+server/worker-configuration.d.ts

@@ -1,0 +1,54 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__cloudflare_supermemory__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=process.env,r=p.PLUGIN_ROOT||p.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('Plugin root is missing');const c=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(r,'scripts/hook-launcher.mjs'),'PreToolUse'],{stdio:'inherit',env:p});if(c.error)throw c.error;process.exit(c.status??1)\"",
+            "timeout": 5,
+            "statusMessage": "Checking memory access..."
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=process.env,r=p.PLUGIN_ROOT||p.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('Plugin root is missing');const c=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(r,'scripts/hook-launcher.mjs'),'SessionStart'],{stdio:'inherit',env:p});if(c.error)throw c.error;process.exit(c.status??1)\"",
+            "timeout": 30,
+            "statusMessage": "Loading memory index..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=process.env,r=p.PLUGIN_ROOT||p.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('Plugin root is missing');const c=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(r,'scripts/hook-launcher.mjs'),'UserPromptSubmit'],{stdio:'inherit',env:p});if(c.error)throw c.error;process.exit(c.status??1)\"",
+            "timeout": 12,
+            "statusMessage": "Searching memory index..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const p=process.env,r=p.PLUGIN_ROOT||p.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('Plugin root is missing');const c=require('node:child_process').spawnSync(process.execPath,[require('node:path').join(r,'scripts/hook-launcher.mjs'),'Stop'],{stdio:'inherit',env:p});if(c.error)throw c.error;process.exit(c.status??1)\"",
+            "timeout": 120,
+            "async": true,
+            "statusMessage": "Saving memory index..."
+          }
+        ]
+      }
+    ]
+  }
+}
