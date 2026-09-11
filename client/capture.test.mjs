@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { cleanUserRequest, parseTaskTranscript, buildTurnDocuments, readSessionMeta, getProjectContext } from "./Import-CodexSupermemoryHistory.mjs";
 import { capture, findTranscript } from "./capture.mjs";
 
@@ -20,6 +23,30 @@ function fixture(t, rows = []) {
   writeFileSync(join(home, "session_index.jsonl"), JSON.stringify({ id: "task-a", thread_name: "保存テスト" }) + "\n");
   return { home, path, meta, payload: { session_id: "task-a", transcript_path: path },
     options: { codexHome: home, config: { baseUrl: "https://example.invalid", apiKey: "test-only-secret" } } };
+}
+
+async function listen(t, handler) {
+  const server = createServer(handler);
+  await new Promise((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  t.after(() => new Promise((resolveClose) => server.close(resolveClose)));
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+function runHistoryImport(args) {
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(process.execPath, [fileURLToPath(new URL("./Import-CodexSupermemoryHistory.mjs", import.meta.url)), ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => resolveRun({ code, stdout, stderr }));
+  });
 }
 
 test("自動注入文を除き、同じメッセージ内の実要求は保持する", () => {
@@ -106,9 +133,67 @@ test("assistant回答を索引上の確認済み事実へ昇格しない", () =>
   const transcript = { turns: [{ user: "保存内容を整理して", assistant: "接続は確認済みです。" }] };
   const project = { projectName: "project", containerTag: "repo_project" };
   const [document] = buildTurnDocuments({ meta: { id: "task", rootSessionId: "task", isSubagent: false } }, transcript, project, "記憶の整理");
+  assert.equal(document.customId, "codex-turn-v2:task:1:f83103950ddfeda11140b10b05c9fc15e1fb9944159f7045d87744b821bf0414:1:f83103950ddfeda1");
+  assert.equal(document.metadata.captureKey, "task:1:f83103950ddfeda11140b10b05c9fc15e1fb9944159f7045d87744b821bf0414:1:f83103950ddfeda1");
+  assert.equal(document.containerTag, "memories");
+  assert.equal(document.reuseExistingCapture, true);
+  assert.equal(document.metadata.project, "project");
+  assert.equal(document.metadata.sm_project_id, "repo_project");
   assert.equal(document.metadata.memoryIndex.description, "保存内容を整理して");
   assert.doesNotMatch(JSON.stringify(document.metadata.memoryIndex), /確認済み|verified|evidence/i);
   assert.match(document.content, /接続は確認済みです。/);
+});
+
+test("明示した保存containerもproject provenanceと決定的IDを変えない", () => {
+  const transcript = { turns: [{ user: "保存内容を整理して", assistant: "接続は確認済みです。" }] };
+  const project = { projectName: "project", containerTag: "repo_project" };
+  const [common] = buildTurnDocuments({ meta: { id: "task", rootSessionId: "task", isSubagent: false } }, transcript, project, "記憶の整理");
+  const [explicit] = buildTurnDocuments({ meta: { id: "task", rootSessionId: "task", isSubagent: false } }, transcript, project, "記憶の整理", 120_000, "intentional-space");
+  assert.equal(explicit.containerTag, "intentional-space");
+  assert.equal(explicit.reuseExistingCapture, undefined);
+  assert.equal(explicit.metadata.sm_project_id, "repo_project");
+  assert.equal(explicit.customId, common.customId);
+  assert.equal(explicit.metadata.captureKey, common.metadata.captureKey);
+});
+
+test("project pathのない履歴も共通containerへ保存しprovenanceを捏造しない", () => {
+  const [document] = buildTurnDocuments({ meta: { id: "old-task", rootSessionId: "old-task", isSubagent: false } },
+    { turns: [{ user: "古い依頼", assistant: "古い結果" }] }, {}, "古い履歴");
+  assert.equal(document.containerTag, "memories");
+  assert.equal(document.reuseExistingCapture, undefined);
+  assert.equal(document.metadata.sm_scope, "shared");
+  assert.equal(document.metadata.project, undefined);
+  assert.equal(document.metadata.sm_project_id, undefined);
+});
+
+test("履歴importは全space一覧から旧containerの同じcaptureKeyを検出して再作成しない", async (t) => {
+  const f = fixture(t, [user("古い依頼"), assistant("古い結果")]);
+  const transcript = await parseTaskTranscript(f.path, []);
+  const [planned] = buildTurnDocuments({ meta: f.meta }, transcript, getProjectContext(f.home), "保存テスト");
+  const listBodies = [];
+  const baseUrl = await listen(t, (request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      assert.equal(request.url, "/v3/documents/list");
+      listBodies.push(JSON.parse(body));
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        documents: [{ id: "legacy-id", containerTags: [planned.metadata.sm_project_id], metadata: planned.metadata }],
+        pagination: { currentPage: 1, totalPages: 1 },
+      }));
+    });
+  });
+  writeFileSync(join(f.home, "supermemory.json"), JSON.stringify({ baseUrl, apiKey: "history-test-key" }));
+  const result = await runHistoryImport(["--codex-home", f.home, "--include-recent", "--session-id", "task-a"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(listBodies, [{ page: 1, limit: 50 }]);
+  const report = JSON.parse(result.stdout);
+  assert.deepEqual(report.containerTags, ["memories"]);
+  assert.equal(report.plannedDocuments, 1);
+  assert.equal(report.unchanged, 1);
+  assert.equal(report.created, 0);
 });
 
 test("作業中の補足要求と、別ターンで繰り返された同じ要求を失わない", async (t) => {
@@ -136,6 +221,8 @@ test("別ターンを追加しても前の文書は保持され、再実行は�
   assert.equal(original.metadata.title, "保存テスト");
   assert.equal(original.metadata.sessionId, "task-a");
   assert.equal(original.metadata.sm_scope, "project");
+  assert.equal(original.containerTag, "memories");
+  assert.match(original.metadata.sm_project_id, /^repo_memory_capture_.*__[a-f0-9]{16}$/);
 });
 
 test("通信結果不明の再送は同じIDで、未確認文書を既送にしない", async (t) => {

@@ -14,7 +14,7 @@ if (event === "SessionStart" || event === "UserPromptSubmit") {
   const result = await runHook(event, payload);
   if (Object.keys(result).length) process.stdout.write(JSON.stringify(result));
 } else if (event === "PreToolUse") {
-  const readOnly = new Set(["search_memory", "listSpaces", "listMemories", "listDocuments", "getDocument", "whoAmI"]);
+  const readOnly = new Set(["search_memory", "listTopics", "listSpaces", "listMemories", "listDocuments", "getDocument", "whoAmI"]);
   const name = /^mcp__cloudflare_supermemory__(.+)$/.exec(payload.tool_name || "")?.[1];
   if (readOnly.has(name)) process.stdout.write(JSON.stringify({
     hookSpecificOutput: {

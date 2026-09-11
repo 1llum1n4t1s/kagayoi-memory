@@ -94,9 +94,28 @@ export function documentIndex(document, fallbackContainer, terms = []) {
   if (saved?.recallable === false) index.recallable = false;
   if (!saved && !request && !metadata.title && !heading) index.recallable = false;
   const containerTag = document.containerTag || document.containerTags?.[0] || fallbackContainer;
+  const topicValues = Array.isArray(document.topics)
+    ? document.topics
+    : typeof document.topic === "string" ? [document.topic] : Array.isArray(metadata.topics) ? metadata.topics : [];
+  const topics = [...new Set(topicValues.filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim()))];
+  const providedProvenance = document.provenance && typeof document.provenance === "object" ? document.provenance : {};
+  const project = typeof metadata.project === "string" && metadata.project.trim() ? metadata.project.trim() : undefined;
+  const projectId = typeof providedProvenance.projectId === "string" && providedProvenance.projectId.trim()
+    ? providedProvenance.projectId.trim()
+    : typeof metadata.sm_project_id === "string" && metadata.sm_project_id.trim() ? metadata.sm_project_id.trim() : undefined;
+  const provenanceContainer = typeof providedProvenance.containerTag === "string" && providedProvenance.containerTag.trim()
+    ? providedProvenance.containerTag.trim()
+    : containerTag;
+  const filepath = typeof providedProvenance.filepath === "string" && providedProvenance.filepath.trim()
+    ? providedProvenance.filepath.trim()
+    : typeof metadata.filepath === "string" && metadata.filepath.trim() ? metadata.filepath.trim() : undefined;
   return {
     id: String(document.id || ""),
     containerTag,
+    topics,
+    provenance: project || projectId || provenanceContainer || filepath
+      ? { containerTag: provenanceContainer, projectId, project, filepath }
+      : undefined,
     ...index,
     createdAt: validDate(document.createdAt),
     updatedAt: validDate(document.updatedAt),
@@ -114,5 +133,9 @@ export function formatIndexItem(item) {
   const when = item.description && item.description !== item.title ? ` — 参照する場面: ${item.description}` : "";
   const sections = item.sections?.length ? `（収録: ${item.sections.slice(0, 2).join("、")}）` : "";
   const parts = item.parts > 1 ? ` | part=${item.part}/${item.parts}` : "";
-  return `- ◪ ${shortText(item.title, 100)}${when}${sections}\n  id=${item.id} | container=${item.containerTag} | ${item.sourceUpdatedAt ? "sourceDate" : "storedDate"}=${timestamp}${parts}`;
+  const topics = item.topics?.length ? ` | topics=${item.topics.join(", ")}` : "";
+  const provenance = item.provenance?.project || item.provenance?.projectId || item.provenance?.containerTag
+    ? ` | provenance=${item.provenance.project || item.provenance.projectId || item.provenance.containerTag}${item.provenance.project && item.provenance.projectId ? ` (${item.provenance.projectId})` : ""}`
+    : "";
+  return `- ◪ ${shortText(item.title, 100)}${when}${sections}\n  id=${item.id}${topics} | container=${item.containerTag || "unknown"}${provenance} | ${item.sourceUpdatedAt ? "sourceDate" : "storedDate"}=${timestamp}${parts}`;
 }

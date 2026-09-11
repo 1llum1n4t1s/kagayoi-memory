@@ -50,20 +50,29 @@ test("MCP初期化は実装済みprotocolとplugin manifestのversionを返す",
 test("tools/listは作業場所が必要なツールだけにsourceFolderを公開する", async () => {
   const response = await exchange({ jsonrpc: "2.0", id: 1, method: "tools/list" });
   const schemas = new Map(response.result.tools.map((tool) => [tool.name, tool.inputSchema.properties]));
-  for (const name of ["add_memory", "listMemories", "listDocuments", "whoAmI"]) {
+  for (const name of ["add_memory", "whoAmI"]) {
     assert.ok(schemas.get(name).sourceFolder, `${name} must expose sourceFolder`);
   }
-  for (const name of ["search_memory", "getDocument", "listSpaces"]) {
+  for (const name of ["search_memory", "listMemories", "listDocuments", "listTopics", "getDocument", "listSpaces"]) {
     assert.equal(schemas.get(name).sourceFolder, undefined, `${name} must not expose sourceFolder`);
   }
 });
 
-test("作業場所を解決できない手動保存はAPIへ送らず明示的に失敗する", async () => {
-  let requests = 0;
-  await assert.rejects(callTool("add_memory", { content: "保存内容" }, {
-    request: async () => { requests += 1; },
-  }), /Cannot determine the current workspace/);
-  assert.equal(requests, 0);
+test("作業場所を解決できない手動保存も共通containerへ保存し出典を捏造しない", async () => {
+  let requestBody;
+  const result = await callTool("add_memory", { content: "保存内容" }, {
+    resolveContext: async () => { throw new Error("roots unavailable"); },
+    request: async (path, options) => {
+      assert.equal(path, "/v3/documents");
+      requestBody = options.body;
+      return { id: "saved-id", status: "created" };
+    },
+  });
+  assert.equal(requestBody.containerTag, "memories");
+  assert.equal(requestBody.metadata.sm_scope, "shared");
+  assert.equal(requestBody.metadata.project, undefined);
+  assert.equal(requestBody.metadata.sm_project_id, undefined);
+  assert.equal(result.structuredContent.containerTag, "memories");
 });
 
 test("sourceFolderから保存先を導出して手動保存の出典へ記録する", async (t) => {
@@ -77,10 +86,51 @@ test("sourceFolderから保存先を導出して手動保存の出典へ記録�
       return { id: "saved-id", status: "created" };
     },
   });
-  assert.match(requestBody.containerTag, /^repo_memory_mcp_source_.*__[a-f0-9]{16}$/);
-  assert.equal(requestBody.metadata.sm_project_id, requestBody.containerTag);
+  assert.equal(requestBody.containerTag, "memories");
+  assert.match(requestBody.metadata.sm_project_id, /^repo_memory_mcp_source_.*__[a-f0-9]{16}$/);
   assert.match(requestBody.metadata.project, /^memory_mcp_source_/);
-  assert.equal(result.structuredContent.containerTag, requestBody.containerTag);
+  assert.equal(result.structuredContent.containerTag, "memories");
+});
+
+test("forgetの既定対象は共通containerだけで、旧project空間へ拡張しない", async () => {
+  const calls = [];
+  const request = async (path, options) => {
+    calls.push([path, options]);
+    return { message: "forgotten" };
+  };
+  await callTool("add_memory", { content: "削除対象", action: "forget" }, { context: getReadContext(process.cwd()), request });
+  await callTool("add_memory", { content: "限定削除", action: "forget", containerTag: "legacy-project" }, { request });
+  assert.deepEqual(calls.map(([, options]) => options.body.containerTag), ["memories", "legacy-project"]);
+  assert.ok(calls.every(([path, options]) => path === "/v4/memories" && options.method === "DELETE"));
+});
+
+test("listTopicsは全空間のtopic件数と未分類件数をページ付きで返す", async () => {
+  const result = await callTool("listTopics", { page: 2, limit: 40 }, { request: async (path) => {
+    assert.equal(path, "/v4/topics?page=2&limit=40");
+    return { topics: [{ topic: "Cloudflare D1", documentCount: 7 }], unclassifiedCount: 3,
+      pagination: { currentPage: 2, limit: 40, totalItems: 41, totalPages: 2 } };
+  } });
+  assert.deepEqual(result.structuredContent, {
+    topics: [{ topic: "Cloudflare D1", documentCount: 7 }],
+    unclassifiedCount: 3,
+    pagination: { currentPage: 2, limit: 40, totalItems: 41, totalPages: 2 },
+  });
+  await callTool("listTopics", {}, { request: async (path) => {
+    assert.equal(path, "/v4/topics");
+    return { topics: [], unclassifiedCount: 0 };
+  } });
+});
+
+test("whoAmIは共通保存先とworkspace provenanceを区別する", async () => {
+  const workspace = getReadContext(process.cwd());
+  const result = await callTool("whoAmI", {}, { context: workspace, request: async (path) => {
+    if (path === "/v3/session") return { user: { id: "user", name: "User" }, role: "owner", accessType: "api-key" };
+    if (path === "/v3/container-tags") return { spaces: [{ containerTag: "memories", memoryCount: 1 }] };
+    assert.fail(`unexpected request: ${path}`);
+  } });
+  assert.equal(result.structuredContent.activeSpace, "memories");
+  assert.equal(result.structuredContent.defaultStorageContainer, "memories");
+  assert.equal(result.structuredContent.workspaceProvenance, workspace.containerTag);
 });
 
 test("全保存先の話題検索は作業場所を解決せず実行できる", async () => {
@@ -227,7 +277,8 @@ test("並行呼び出しはroots取得を共有し、取得中の更新後は全
           if (toolResponses.length === 3) {
             assert.equal(rootRequests.length, 2);
             assert.equal(documents.length, 3);
-            assert.ok(documents.every((document) => document.containerTag === expectedTag));
+            assert.ok(documents.every((document) => document.containerTag === "memories"));
+            assert.ok(documents.every((document) => document.metadata.sm_project_id === expectedTag));
             finished = true;
             clearTimeout(timeout);
             child.stdin.end();

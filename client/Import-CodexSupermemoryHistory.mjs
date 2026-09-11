@@ -23,6 +23,7 @@ const MAX_DOCUMENT_CHARS = 180_000;
 const DEFAULT_LIST_LIMIT = 50;
 const RECENT_TRANSCRIPT_WINDOW_MS = 10 * 60 * 1000;
 const REDACTED = "[REDACTED]";
+export const DEFAULT_MEMORY_CONTAINER = "memories";
 
 function fail(message) {
   throw new Error(message);
@@ -414,8 +415,11 @@ async function readTaskTitles(codexHome) {
   return result;
 }
 
-function buildTurnDocuments(candidate, transcript, project, title, maxChars = DEFAULT_MAX_DOCUMENT_CHARS) {
+function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars = DEFAULT_MAX_DOCUMENT_CHARS, containerTag) {
   const safeTitle = sanitizeText(title || transcript.turns[0]?.user.split("\n")[0] || "Codex task", [], { count: 0 }).slice(0, 200);
+  const hasProjectProvenance = typeof project.containerTag === "string" && Boolean(project.containerTag.trim());
+  const reuseExistingCapture = containerTag === undefined && hasProjectProvenance;
+  containerTag ||= DEFAULT_MEMORY_CONTAINER;
   return transcript.turns.flatMap((turn, index) => {
     const body = `### User request\n${turn.user}\n\n### Final assistant response\n${turn.assistant}`;
     // 本文ハッシュをIDに含め、再送は同じID、別内容は別IDにする。
@@ -428,10 +432,13 @@ function buildTurnDocuments(candidate, transcript, project, title, maxChars = DE
     return parts.map((part, partIndex) => ({
       customId: `codex-turn-v2:${identity}:${partIndex + 1}:${sha256(part).slice(0, 16)}`,
       content: `${header}Part: ${partIndex + 1}/${parts.length}\n\n${part}`,
-      containerTag: project.containerTag,
+      containerTag,
+      ...(reuseExistingCapture ? { reuseExistingCapture: true } : {}),
       metadata: {
-        type: "conversation", title: safeTitle, project: project.projectName,
-        sm_project_id: project.containerTag, sm_scope: "project", sm_source: "codex",
+        type: "conversation", title: safeTitle,
+        ...(project.projectName ? { project: project.projectName } : {}),
+        ...(hasProjectProvenance ? { sm_project_id: project.containerTag } : {}),
+        sm_scope: hasProjectProvenance ? "project" : "shared", sm_source: "codex",
         sm_client: "codex-cloudflare", sessionId: candidate.meta.id,
         rootSessionId: candidate.meta.rootSessionId, sessionKind: candidate.meta.isSubagent ? "subagent" : "root",
         turn: index + 1, part: partIndex + 1, parts: parts.length,
@@ -495,7 +502,7 @@ async function listDocuments(config, containerTag) {
   while (true) {
     const result = await api(config, "/v3/documents/list", {
       method: "POST",
-      body: { containerTag, page, limit: DEFAULT_LIST_LIMIT },
+      body: { ...(containerTag ? { containerTag } : {}), page, limit: DEFAULT_LIST_LIMIT },
     });
     const batch = Array.isArray(result?.documents) ? result.documents : [];
     documents.push(...batch);
@@ -545,26 +552,22 @@ async function main() {
   let redactions = 0;
   const projects = new Map();
   for (const candidate of selectedCandidates) {
-    if (!candidate.meta.cwd && !options.containerTag) fail("A session has no project path; specify --container-tag explicitly.");
-    const projectPath = candidate.meta.cwd || process.cwd();
-    if (!projects.has(projectPath)) projects.set(projectPath, getProjectContext(projectPath));
-    const project = { ...projects.get(projectPath) };
-    if (options.containerTag) project.containerTag = options.containerTag;
+    const projectPath = candidate.meta.cwd;
+    if (projectPath && !projects.has(projectPath)) projects.set(projectPath, getProjectContext(projectPath));
+    const project = projectPath ? { ...projects.get(projectPath) } : {};
     const transcript = await parseTaskTranscript(candidate.filePath, [config.apiKey]);
     turnCount += transcript.turns.length;
     redactions += transcript.redactions;
     planned.push(...buildTurnDocuments(candidate, transcript, project,
-      sanitizeText(titles.get(candidate.meta.id) || "", [config.apiKey], { count: 0 }), options.maxDocumentChars));
+      sanitizeText(titles.get(candidate.meta.id) || "", [config.apiKey], { count: 0 }), options.maxDocumentChars,
+      options.containerTag || undefined));
   }
   const existingHistory = new Set();
-  let existingCount = 0;
-  for (const tag of new Set(planned.map((document) => document.containerTag))) {
-    const existing = await listDocuments(config, tag);
-    existingCount += existing.length;
-    for (const document of existing) {
-      if (document.metadata?.captureVersion === 2 && document.metadata?.captureKey) {
-        existingHistory.add(`${tag}:${document.metadata.captureKey}`);
-      }
+  const existing = planned.length ? await listDocuments(config) : [];
+  const existingCount = existing.length;
+  for (const document of existing) {
+    if (document.metadata?.captureVersion === 2 && document.metadata?.captureKey) {
+      existingHistory.add(document.metadata.captureKey);
     }
   }
   let created = 0;
@@ -573,8 +576,8 @@ async function main() {
   const state = options.apply ? loadState(options.statePath) : null;
   if (options.apply) {
     for (const document of planned) {
-      const key = `${document.containerTag}:${document.metadata.captureKey}`;
-      if (existingHistory.has(key)) { unchanged += 1; continue; }
+      const key = `${document.metadata.sm_project_id || document.containerTag}:${document.metadata.captureKey}`;
+      if (existingHistory.has(document.metadata.captureKey)) { unchanged += 1; continue; }
       const result = await api(config, "/v3/documents", { method: "POST", body: document });
       if (!result || typeof result.id !== "string" || !result.id) fail("Memory API did not acknowledge the document.");
       created += 1;
@@ -582,7 +585,7 @@ async function main() {
       saveState(options.statePath, state);
     }
   } else {
-    unchanged = planned.filter((document) => existingHistory.has(`${document.containerTag}:${document.metadata.captureKey}`)).length;
+    unchanged = planned.filter((document) => existingHistory.has(document.metadata.captureKey)).length;
   }
 
   const rootSessions = selectedCandidates.filter((candidate) => !candidate.meta.isSubagent).length;

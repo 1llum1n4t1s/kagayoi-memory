@@ -2,7 +2,7 @@
 
 A Codex plugin and self-hosted Cloudflare backend for recalling useful implementation history across project folders.
 
-The plugin saves completed work with its project folder as provenance. When a later prompt mentions a topic such as “Chrome extension,” recall searches every discovered memory space, injects concise indexes, and lets Codex open an applicable source record through MCP before reusing the implementation.
+The plugin saves completed work in a shared collection and keeps its project folder as provenance. Browse records by content topics, or ask about a topic such as “Chrome extension”: recall searches every discovered memory space, injects concise indexes, and lets Codex open an applicable source record through MCP before reusing the implementation.
 
 ## Requirements
 
@@ -40,12 +40,23 @@ Keep the local Wrangler configuration for future updates. Never commit generated
 
 ## Memory behavior
 
-- Completed user requests and final answers are saved with deterministic IDs and source-folder provenance.
-- Manual `add_memory` and project-scoped lists use a single workspace root advertised by the MCP client. If unavailable, pass an absolute `sourceFolder` or an explicit `containerTag`; the plugin never treats its installation folder as the user's project.
+- Completed user requests and final answers are saved in the shared `memories` collection with deterministic IDs and source-folder provenance.
+- Use `listTopics` to find content categories, then pass a `topic` to `listDocuments` or `listMemories`. Lists include records across both legacy folder spaces and the shared collection. Use `topic: "__unclassified__"` to see records awaiting classification.
+- Manual `add_memory` saves to the shared collection. An absolute `sourceFolder` or a single workspace root supplied by the MCP client adds provenance; an explicit `containerTag` overrides storage. The plugin never uses its installation folder as the user's project. `listSpaces` exposes physical spaces for compatibility and diagnostics.
 - Prompt recall searches every discovered nonempty space by topic. The initial session event does not inject unrelated recent records.
 - Automatic context contains a title, description, section names, timestamps, and document IDs. Codex opens full records with `getDocument` when needed.
 - Capture preserves existing v2 IDs and JSON sent-document receipts, serializes receipt updates through Node's built-in SQLite, redacts configured secrets, and retries unacknowledged records. The small coordination database stays under `cloudflare-memory/capture-state/` in the selected Codex home.
 - Space discovery is capped by the current server API at 100. A full page is reported as incomplete rather than claiming exhaustive search.
+
+Topics are derived from record content during the existing Workers AI enrichment step. Classification is asynchronous; with AI enrichment disabled or failed, records remain accessible through the unclassified list. Folder names are retained as source metadata. Existing records keep their original document IDs and storage locations and appear in the same topic browser.
+
+Update the server and apply its migrations before installing a client that uses topic browsing. To classify old records, preview a bounded batch using the existing memory connection:
+
+```powershell
+node scripts/setup-topics.mjs --limit 10
+```
+
+Add `--apply` to queue the selected records for enrichment. This uses the backend's existing Workers AI billing and refreshes the records' derived enrichment. The result reports accepted jobs, not completed classification. Wait for processing to finish before selecting the next batch; inspect `getDocument` and `listTopics` to verify the result.
 
 The API key grants access to the records in one server installation. Use separate installations for separate trust boundaries. Redaction reduces accidental secret capture; review what you choose to store in your own backend.
 

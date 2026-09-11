@@ -29,7 +29,7 @@ export function readSettings(codexHome = process.env.CODEX_HOME || join(homedir(
   };
 }
 
-// capture、MCP、注入は同じcanonicalを使う。旧Supermemory空間は読取り用の別名としてだけ扱う。
+// project由来tagは出典と旧Supermemory空間の検索用別名として扱い、新規保存は共通containerへ集約する。
 // Codex公式のmemoriesディレクトリや生成物を開く処理は持たない。
 export function getReadContext(cwd = process.cwd(), settings = readSettings()) {
   const project = getProjectContext(cwd);
@@ -85,7 +85,7 @@ export function queryTerms(query) {
 }
 
 function topicRelevance(index, terms) {
-  const topic = `${index.title} ${index.description} ${(index.sections || []).join(" ")}`.toLowerCase();
+  const topic = `${index.title} ${index.description} ${(index.sections || []).join(" ")} ${(index.topics || []).join(" ")}`.toLowerCase();
   if (!terms.length) return 0;
   const matches = terms.filter((term) => topic.includes(term));
   if (!matches.length) return 0;
@@ -123,8 +123,7 @@ async function mapConcurrent(values, concurrency, task) {
 
 export async function searchIndex({ query = "", containerTag, cwd, settings = readSettings(), context, limit = settings.maxMemories, request = api, automatic = false } = {}) {
   query = typeof query === "string" ? query.trim().slice(0, 1_000) : "";
-  context ||= getReadContext(cwd, settings);
-  if (!query) return { query, containerTag: containerTag || context.containerTag, searchScope: "none", searchedContainers: [], failedContainers: [], failedDocuments: [], spaceDiscoveryComplete: true, results: [], total: 0 };
+  if (!query) return { query, containerTag: containerTag || null, searchScope: "none", searchedContainers: [], failedContainers: [], failedDocuments: [], spaceDiscoveryComplete: true, results: [], total: 0 };
   const discovery = containerTag ? { tags: [containerTag], complete: true, returnedCount: 1 } : await discoverSearchContainers(request);
   const tags = discovery.tags;
   const results = await mapConcurrent(tags, SEARCH_CONCURRENCY, async (tag) => {
@@ -176,7 +175,7 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
   }
   return {
     query,
-    containerTag: containerTag || context.containerTag,
+    containerTag: containerTag || null,
     searchScope: containerTag ? "explicit-container" : "all-discovered-containers",
     searchedContainers: tags,
     failedContainers: failedTags,
@@ -195,10 +194,34 @@ export function formatSearchResult(result) {
   return `${text}${failure}${discovery}\nWhen an entry appears applicable, read the original with getDocument(documentId), validate it against the current implementation, and reuse the parts that still fit.`;
 }
 
-export async function listIndex({ containerTag, page = 1, limit = 10, context = getReadContext(), request = api } = {}) {
-  containerTag ||= context.containerTag;
-  const result = await request("/v3/documents/list", { body: { containerTag, page, limit } });
-  return { documents: (result.documents || []).map((d) => documentIndex(d, containerTag)), pagination: result.pagination, containerTag };
+export async function listIndex({ containerTag, topic, page = 1, limit = 10, request = api } = {}) {
+  const body = { page, limit, ...(containerTag ? { containerTag } : {}), ...(topic ? { topic } : {}) };
+  const result = await request("/v3/documents/list", { body });
+  if (!Array.isArray(result?.documents)) throw new Error("Invalid memory document-list response");
+  return {
+    documents: result.documents.map((document) => documentIndex(document, containerTag)),
+    pagination: result.pagination,
+    containerTag: containerTag || null,
+    topic: topic || null,
+    listScope: containerTag ? "explicit-container" : "all-containers",
+  };
+}
+
+export async function listTopics(request = api, options = {}) {
+  const page = options.page ?? 1;
+  const limit = options.limit ?? 100;
+  const query = options.page === undefined && options.limit === undefined ? "" : `?page=${page}&limit=${limit}`;
+  const result = await request(`/v4/topics${query}`);
+  if (!Array.isArray(result?.topics) || !Number.isInteger(result.unclassifiedCount) || result.unclassifiedCount < 0) {
+    throw new Error("Invalid memory topic-list response");
+  }
+  const topics = result.topics.map((entry) => {
+    if (!entry || typeof entry.topic !== "string" || !entry.topic || !Number.isInteger(entry.documentCount) || entry.documentCount < 0) {
+      throw new Error("Invalid memory topic-list response");
+    }
+    return { topic: entry.topic, documentCount: entry.documentCount };
+  });
+  return { topics, unclassifiedCount: result.unclassifiedCount, ...(result.pagination ? { pagination: result.pagination } : {}) };
 }
 
 export async function readDocument(documentId, request = api) {

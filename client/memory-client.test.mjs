@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildMemoryIndex, documentIndex } from "./memory-index.mjs";
-import { searchIndex, readDocument, getReadContext, queryTerms } from "./memory-client.mjs";
+import { searchIndex, listIndex, readDocument, getReadContext, queryTerms } from "./memory-client.mjs";
 import { runHook } from "./memory-hooks.mjs";
 import { callTool } from "./mcp-server.mjs";
 import { buildTurnDocuments, cleanUserRequest } from "./Import-CodexSupermemoryHistory.mjs";
@@ -75,6 +75,14 @@ test("低スコア候補と高スコアでも拡張だけが一致する別話�
   assert.deepEqual(semanticOnly, {});
 });
 
+test("分類済みtopicに検索語が一致する索引はタイトルが別でも自動注入する", async () => {
+  const classified = row("classified-topic", "shared", { similarity: 0.61, topics: ["Cloudflare D1"],
+    metadata: { memoryIndex: buildMemoryIndex({ title: "保存基盤の設計", request: "永続化方式を整理する" }) } });
+  const result = await runHook("UserPromptSubmit", { prompt: "Cloudflare D1" }, { settings, context,
+    request: withDiscovery(async () => ({ results: [classified] }), ["shared"]) });
+  assert.match(result.hookSpecificOutput.additionalContext, /id=classified-topic.*topics=Cloudflare D1/);
+});
+
 test("短い相づちと出典のない旧fact断片は索引として自動注入しない", async () => {
   const ack = row("ack", "project", { metadata: { memoryIndex: buildMemoryIndex({ title: "Kiriha", request: "ありがとうございます。", response: "どういたしまして。" }) } });
   const fact = row("fact", "project", { metadata: {}, content: "Kiriha has BookmarkTree selection logic" });
@@ -119,7 +127,7 @@ test("保存文書の索引からgetDocumentで欠落なく同じ原文に戻れ
     { containerTag: "project", projectName: "Kiriha" }, "Kirihaの選択解除");
   const document = { ...saved, id: "actual-id", createdAt: date, updatedAt: date, similarity: 0.85 };
   const request = async (path) => path === "/v4/search" ? { results: [document] } : document;
-  const result = await searchIndex({ query: "Kiriha", containerTag: "project", settings, context, request });
+  const result = await searchIndex({ query: "Kiriha", containerTag: "memories", settings, context, request });
   assert.equal(result.results[0].sourceUpdatedAt, date);
   assert.doesNotMatch(JSON.stringify(result), /DETAIL_ONLY|未確定/);
   const detail = await readDocument(result.results[0].id, async (path) => {
@@ -127,7 +135,8 @@ test("保存文書の索引からgetDocumentで欠落なく同じ原文に戻れ
   });
   assert.equal(detail.document.content, saved.content);
   assert.match(detail.text, /検証結果は未確定/);
-  assert.equal(detail.document.index.containerTag, "project");
+  assert.equal(detail.document.index.containerTag, "memories");
+  assert.deepEqual(detail.document.index.provenance, { containerTag: "memories", projectId: "project", project: "Kiriha", filepath: undefined });
 });
 
 test("旧文書も本文を索引から分離し、新しい保存日時を原文の日時と誤表示しない", () => {
@@ -137,6 +146,11 @@ test("旧文書も本文を索引から分離し、新しい保存日時を原�
   assert.equal(index.description, "ブックマークの並び順を調べて");
   assert.equal(index.sourceUpdatedAt, undefined);
   assert.doesNotMatch(JSON.stringify(index), /DETAIL_ONLY/);
+});
+
+test("serverが返す空topicsは旧metadata topicより優先する", () => {
+  const index = documentIndex({ id: "doc", content: "new", topics: [], metadata: { topics: ["obsolete"] } });
+  assert.deepEqual(index.topics, []);
 });
 
 test("注釈付き依頼では現在の要求を索引と検索語に使い、注入を再保存しない", async () => {
@@ -166,6 +180,8 @@ test("MCPツールはスキーマ外の値をAPIへ送信しない", async () =>
     ["add_memory", { content: "" }],
     ["listDocuments", { page: 0 }],
     ["listMemories", { limit: 51 }],
+    ["listDocuments", { topic: " " }],
+    ["listTopics", { limit: 101 }],
     ["getDocument", { documentId: " " }],
   ];
   for (const [name, args] of invalidCalls) {
@@ -180,6 +196,34 @@ test("一覧は全文を返さず詳細IDを返す", async () => {
     assert.doesNotMatch(JSON.stringify(result), /DETAIL_ONLY/);
     assert.match(JSON.stringify(result), /doc-1/);
   }
+});
+
+test("文書一覧は既定で全spaceを横断し、topicと物理containerを独立して絞り込む", async () => {
+  const calls = [];
+  const request = async (path, { body }) => {
+    calls.push([path, body]);
+    return { documents: [{ ...row("topic-doc", "legacy-space"), topics: ["Cloudflare D1"], metadata: {
+      ...row().metadata,
+      project: "memory-service",
+      sm_project_id: "repo_memory_service__1234",
+    } }], pagination: { currentPage: 1 } };
+  };
+  const all = await listIndex({ topic: "Cloudflare D1", request });
+  const limited = await listIndex({ containerTag: "memories", topic: "__unclassified__", page: 2, limit: 5, request });
+  assert.deepEqual(calls, [
+    ["/v3/documents/list", { page: 1, limit: 10, topic: "Cloudflare D1" }],
+    ["/v3/documents/list", { page: 2, limit: 5, containerTag: "memories", topic: "__unclassified__" }],
+  ]);
+  assert.equal(all.listScope, "all-containers");
+  assert.equal(all.containerTag, null);
+  assert.deepEqual(all.documents[0].topics, ["Cloudflare D1"]);
+  assert.deepEqual(all.documents[0].provenance, {
+    containerTag: "legacy-space",
+    projectId: "repo_memory_service__1234",
+    project: "memory-service",
+    filepath: undefined,
+  });
+  assert.equal(limited.listScope, "explicit-container");
 });
 
 test("統一した読取り空間には保存canonicalと明示された共有空間が含まれる", () => {

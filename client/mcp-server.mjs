@@ -3,7 +3,8 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { api, getReadContext, searchIndex, listIndex, readDocument, formatSearchResult, discoverSearchContainers } from "./memory-client.mjs";
+import { api, getReadContext, searchIndex, listIndex, listTopics, readDocument, formatSearchResult, discoverSearchContainers } from "./memory-client.mjs";
+import { DEFAULT_MEMORY_CONTAINER } from "./Import-CodexSupermemoryHistory.mjs";
 import { buildMemoryIndex } from "./memory-index.mjs";
 
 const SERVER_VERSION = JSON.parse(readFileSync(new URL("../.codex-plugin/plugin.json", import.meta.url), "utf8")).version;
@@ -14,6 +15,7 @@ const pathKey = (value) => process.platform === "win32" ? value.toLowerCase() : 
 
 const stringSchema = { type: "string", minLength: 1 };
 const containerProperty = { type: "string", minLength: 1, maxLength: 160, description: "Optional memory space tag" };
+const topicProperty = { type: "string", minLength: 1, maxLength: 80, description: "Optional exact topic label; use __unclassified__ for documents without a topic" };
 const sourceFolderProperty = {
   type: "string",
   minLength: 1,
@@ -38,7 +40,7 @@ const tools = [
   },
   {
     name: "add_memory",
-    description: "Save or forget a memory in the user's Cloudflare D1 database. When containerTag is omitted, pass sourceFolder as the absolute current workspace if client roots are unavailable.",
+    description: "Save or forget a memory in the user's Cloudflare D1 database. Saves use the shared memories container by default; sourceFolder optionally records workspace provenance. An explicit containerTag overrides the physical storage container. Forget is always restricted to that one explicit or default container.",
     inputSchema: {
       type: "object",
       properties: {
@@ -54,20 +56,20 @@ const tools = [
   },
   {
     name: "listMemories",
-    description: "List recent memory indexes in one space; use getDocument for full details. Pass containerTag or sourceFolder when the current workspace cannot be resolved from client roots.",
+    description: "List recent memory indexes across all physical spaces; use getDocument for full details. An exact topic filters by content label, and an explicit containerTag restricts the physical space.",
     inputSchema: {
       type: "object",
-      properties: { page: { type: "integer", minimum: 1 }, limit: { type: "integer", minimum: 1, maximum: 50 }, containerTag: containerProperty, sourceFolder: sourceFolderProperty },
+      properties: { page: { type: "integer", minimum: 1 }, limit: { type: "integer", minimum: 1, maximum: 50 }, containerTag: containerProperty, topic: topicProperty },
       additionalProperties: false,
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
     name: "listDocuments",
-    description: "List stored document indexes with provenance; use getDocument for full details. Pass containerTag or sourceFolder when the current workspace cannot be resolved from client roots.",
+    description: "List stored document indexes with topic and provenance across all physical spaces; use getDocument for full details. An exact topic filters by content label, and an explicit containerTag restricts the physical space.",
     inputSchema: {
       type: "object",
-      properties: { page: { type: "integer", minimum: 1 }, limit: { type: "integer", minimum: 1, maximum: 50 }, containerTag: containerProperty, sourceFolder: sourceFolderProperty },
+      properties: { page: { type: "integer", minimum: 1 }, limit: { type: "integer", minimum: 1, maximum: 50 }, containerTag: containerProperty, topic: topicProperty },
       additionalProperties: false,
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -79,8 +81,18 @@ const tools = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
+    name: "listTopics",
+    description: "List content topics across all legacy and shared memory spaces, including the count of unclassified documents.",
+    inputSchema: {
+      type: "object",
+      properties: { page: { type: "integer", minimum: 1 }, limit: { type: "integer", minimum: 1, maximum: 100 } },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: "listSpaces",
-    description: "List memory spaces stored in Cloudflare D1.",
+    description: "List physical memory spaces and legacy project-folder provenance tags for compatibility. Use listTopics for ordinary browsing.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -135,20 +147,21 @@ export async function callTool(name, args, { request = api, context, settings, r
   if (name === "add_memory") {
     if (typeof args.content !== "string" || !args.content.trim() || args.content.length > 200_000) throw new Error("content must be a nonempty string of at most 200000 characters.");
     if (args.action !== undefined && args.action !== "save" && args.action !== "forget") throw new Error("action must be save or forget.");
-    const workspace = explicitTag ? explicitContext : await workspaceContext();
-    const containerTag = explicitTag || workspace?.containerTag;
-    if (!containerTag) {
-      throw new Error("Cannot determine the current workspace. Pass sourceFolder as an absolute path or specify containerTag explicitly.");
-    }
+    const containerTag = explicitTag || DEFAULT_MEMORY_CONTAINER;
     if (args.action === "forget") {
       const result = await request("/v4/memories", { method: "DELETE", body: { containerTag, content: args.content } });
       return textResult(result.message, { action: "forget", success: true, containerTag, message: result.message });
     }
 
+    let workspace = explicitContext;
+    if (!workspace && !explicitTag) {
+      try { workspace = await workspaceContext(); }
+      catch { workspace = null; }
+    }
     const result = await request("/v3/documents", {
       method: "POST",
-      body: { containerTag, content: args.content, metadata: { sm_source: "codex-mcp", sm_scope: "project",
-        ...(workspace ? { project: workspace.projectName, sm_project_id: containerTag } : {}),
+      body: { containerTag, content: args.content, metadata: { sm_source: "codex-mcp", sm_scope: workspace ? "project" : "shared",
+        ...(workspace ? { project: workspace.projectName, sm_project_id: workspace.containerTag } : {}),
         memoryIndex: buildMemoryIndex({ request: args.content, sourceKind: "explicit-memory" }) } },
     });
     const message = `Memory saved in Cloudflare D1 (ID: ${result.id})`;
@@ -158,14 +171,18 @@ export async function callTool(name, args, { request = api, context, settings, r
   if (name === "listMemories" || name === "listDocuments") {
     if (args.page !== undefined && (!Number.isInteger(args.page) || args.page < 1)) throw new Error("page must be a positive integer.");
     if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 50)) throw new Error("limit must be an integer from 1 through 50.");
-    const workspace = explicitTag ? explicitContext : await workspaceContext();
-    const containerTag = explicitTag || workspace?.containerTag;
-    if (!containerTag) {
-      throw new Error("Cannot determine the current workspace. Pass sourceFolder as an absolute path or specify containerTag explicitly.");
+    if (args.topic !== undefined && (typeof args.topic !== "string" || !args.topic.trim() || args.topic.length > 80)) {
+      throw new Error("topic must be a nonempty string of at most 80 characters.");
     }
-    const result = await listIndex({ containerTag, page: args.page ?? 1, limit: args.limit ?? 10, context, request });
+    const result = await listIndex({ containerTag: explicitTag, topic: args.topic?.trim(), page: args.page ?? 1, limit: args.limit ?? 10, request });
     const items = result.documents;
-    return textResult(JSON.stringify(items, null, 2), { [name === "listMemories" ? "memoryEntries" : "documents"]: items, pagination: result.pagination });
+    return textResult(JSON.stringify(items, null, 2), {
+      [name === "listMemories" ? "memoryEntries" : "documents"]: items,
+      pagination: result.pagination,
+      containerTag: result.containerTag,
+      topic: result.topic,
+      listScope: result.listScope,
+    });
   }
 
   if (name === "getDocument") {
@@ -179,6 +196,16 @@ export async function callTool(name, args, { request = api, context, settings, r
     return textResult(JSON.stringify(result.spaces, null, 2), result);
   }
 
+  if (name === "listTopics") {
+    if (args.page !== undefined && (!Number.isInteger(args.page) || args.page < 1)) throw new Error("page must be a positive integer.");
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)) throw new Error("limit must be an integer from 1 through 100.");
+    const result = await listTopics(request, {
+      ...(args.page === undefined ? {} : { page: args.page }),
+      ...(args.limit === undefined ? {} : { limit: args.limit }),
+    });
+    return textResult(JSON.stringify(result, null, 2), result);
+  }
+
   if (name === "whoAmI") {
     const workspace = await workspaceContext();
     const [session, discovery] = await Promise.all([request("/v3/session"), discoverSearchContainers(request)]);
@@ -187,7 +214,9 @@ export async function callTool(name, args, { request = api, context, settings, r
       name: session.user.name,
       role: session.role,
       accessType: session.accessType,
-      activeSpace: workspace?.containerTag || null,
+      activeSpace: DEFAULT_MEMORY_CONTAINER,
+      defaultStorageContainer: DEFAULT_MEMORY_CONTAINER,
+      workspaceProvenance: workspace?.containerTag || null,
       workspaceSource: workspace?.workspaceSource || (explicitContext ? "provided-context" : "unavailable"),
       searchScope: "all-discovered-containers",
       readSpaces: discovery.tags,
