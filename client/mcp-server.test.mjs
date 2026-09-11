@@ -40,7 +40,7 @@ function exchange(message) {
 }
 
 test("MCP初期化は実装済みprotocolとplugin manifestのversionを返す", async () => {
-  const manifest = JSON.parse(readFileSync(new URL("../plugin.json", import.meta.url), "utf8"));
+  const manifest = JSON.parse(readFileSync(new URL("../.codex-plugin/plugin.json", import.meta.url), "utf8"));
   const response = await exchange({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2099-01-01" } });
   assert.equal(response.result.protocolVersion, "2025-06-18");
   assert.equal(response.result.serverInfo.version, manifest.version);

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "cloudflare_supermemory": {
+      "command": "node",
+      "args": [
+        "./scripts/mcp-launcher.mjs"
+      ],
+      "cwd": "."
+    }
+  }
+}

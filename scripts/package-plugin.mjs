@@ -9,10 +9,9 @@ export const DEFAULT_OUTPUT = path.join(REPOSITORY_ROOT, "dist", "cloudflare-sup
 
 const REQUIRED_FILES = new Set([
   ".codex-plugin/plugin.json",
+  ".mcp.json",
   "README.md",
   "hooks/hooks.json",
-  "mcp.json",
-  "plugin.json",
   "scripts/hook-launcher.mjs",
   "scripts/mcp-launcher.mjs",
   "scripts/setup-client.ps1",

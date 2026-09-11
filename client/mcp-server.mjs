@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { api, getReadContext, searchIndex, listIndex, readDocument, formatSearchResult, discoverSearchContainers } from "./memory-client.mjs";
 import { buildMemoryIndex } from "./memory-index.mjs";
 
-const SERVER_VERSION = JSON.parse(readFileSync(new URL("../plugin.json", import.meta.url), "utf8")).version;
+const SERVER_VERSION = JSON.parse(readFileSync(new URL("../.codex-plugin/plugin.json", import.meta.url), "utf8")).version;
 const PROTOCOL_VERSION = "2025-06-18";
 const RUNTIME_PLUGIN_ROOT = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const UNRESOLVED_CONTEXT = { containerTag: undefined, projectName: undefined, projectTags: [], sharedTags: [], readTags: [] };

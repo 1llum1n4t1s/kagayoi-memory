@@ -22,5 +22,6 @@
       "Search my memory for a previous implementation.",
       "Show the current memory connection status."
     ]
-  }
+  },
+  "mcpServers": "./.mcp.json"
 }

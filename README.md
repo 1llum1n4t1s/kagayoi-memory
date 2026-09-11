@@ -53,7 +53,7 @@ This project implements its own Supermemory-compatible API. It is independent of
 
 ## Repository layout
 
-- `plugin.json`, `mcp.json`, `.codex-plugin/`, `hooks/`: portable plugin manifests and Codex compatibility metadata
+- `.codex-plugin/`, `.mcp.json`, `hooks/`: Codex plugin manifests and lifecycle hooks
 - `client/`: MCP server, topic recall, capture hooks, and tests
 - `server/`: Cloudflare Worker, D1 migrations, and API tests
 - `scripts/`: portable plugin launchers and setup utilities

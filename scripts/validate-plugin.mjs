@@ -52,31 +52,11 @@ async function listFiles(root, relativeDirectory = "") {
   return files;
 }
 
-function validatePortablePluginManifest(plugin, errors) {
-  if (!plugin || typeof plugin !== "object") return;
-  if (plugin.$schema !== "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json") {
-    errors.push("plugin.json: unsupported or missing plugin schema");
-  }
-  if (!/^[a-z0-9-]+$/u.test(plugin.name ?? "")) errors.push("plugin.json: name must be lowercase kebab-case");
-  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(plugin.version ?? "")) errors.push("plugin.json: version must be SemVer");
-  if (typeof plugin.description !== "string" || !plugin.description.trim()) errors.push("plugin.json: description is required");
-  if (typeof plugin.author?.name !== "string" || !plugin.author.name.trim()) errors.push("plugin.json: author.name is required");
-  if (plugin.license !== "MIT") errors.push("plugin.json: license must match the distributed MIT license");
-  const openAi = plugin.extensions?.["com.openai"];
-  if (!openAi || typeof openAi !== "object") {
-    errors.push("plugin.json: extensions.com.openai is required");
-    return;
-  }
-  if (typeof openAi.interface?.displayName !== "string" || typeof openAi.interface?.shortDescription !== "string") {
-    errors.push("plugin.json: extensions.com.openai.interface displayName and shortDescription are required");
-  }
-}
-
-function validateLegacyPluginManifest(plugin, errors) {
+function validatePluginManifest(plugin, errors) {
   if (!plugin || typeof plugin !== "object") return;
   if (!/^[a-z0-9-]+$/u.test(plugin.name ?? "")) errors.push(".codex-plugin/plugin.json: name must be lowercase kebab-case");
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(plugin.version ?? "")) errors.push(".codex-plugin/plugin.json: version must be SemVer");
-  for (const field of ["description", "skills"]) {
+  for (const field of ["description", "skills", "mcpServers"]) {
     if (typeof plugin[field] !== "string" || !plugin[field].trim()) errors.push(`.codex-plugin/plugin.json: ${field} is required`);
   }
   if (typeof plugin.interface?.displayName !== "string" || typeof plugin.interface?.shortDescription !== "string") {
@@ -87,21 +67,22 @@ function validateLegacyPluginManifest(plugin, errors) {
 function validateMcpManifest(mcp, errors) {
   const servers = mcp?.mcpServers;
   if (!servers || typeof servers !== "object" || Array.isArray(servers) || !Object.keys(servers).length) {
-    errors.push("mcp.json: at least one MCP server is required");
+    errors.push(".mcp.json: at least one MCP server is required");
     return;
   }
   for (const [name, server] of Object.entries(servers)) {
-    const prefix = `mcp.json: mcpServers.${name}`;
+    const prefix = `.mcp.json: mcpServers.${name}`;
     if (server?.command !== "node") errors.push(`${prefix}.command must be node`);
     if (!Array.isArray(server?.args) || !server.args.every((arg) => typeof arg === "string")) {
       errors.push(`${prefix}.args must be an array of strings`);
       continue;
     }
     const command = server.args.join(" ");
-    if (server?.type !== "stdio") errors.push(`${prefix}.type must be stdio`);
-    if (server?.cwd !== undefined) errors.push(`${prefix}.cwd must be omitted so task provenance uses the caller's working directory`);
-    if (server.args.length !== 1 || server.args[0] !== "${PLUGIN_ROOT}/scripts/mcp-launcher.mjs") {
-      errors.push(`${prefix} must launch the portable \${PLUGIN_ROOT}/scripts/mcp-launcher.mjs path`);
+    if (server.args.length !== 1 || server.args[0] !== "./scripts/mcp-launcher.mjs") {
+      errors.push(`${prefix} must launch ./scripts/mcp-launcher.mjs relative to the installed plugin`);
+    }
+    if (server.cwd !== ".") {
+      errors.push(`${prefix}.cwd must be . so Codex resolves the launcher from the installed plugin root`);
     }
     if (/[A-Za-z]:[\\/]|(?:^|["'])\/(?:home|Users)\//u.test(command) || command.includes("\\")) {
       errors.push(`${prefix} contains a machine-specific or non-portable path`);
@@ -175,21 +156,19 @@ async function validateText(root, files, errors) {
 export async function validatePlugin(root = REPOSITORY_ROOT) {
   const resolvedRoot = path.resolve(root);
   const errors = [];
-  const plugin = await parseJson(resolvedRoot, "plugin.json", errors);
-  const legacyPlugin = await parseJson(resolvedRoot, ".codex-plugin/plugin.json", errors);
-  const mcp = await parseJson(resolvedRoot, "mcp.json", errors);
+  const plugin = await parseJson(resolvedRoot, ".codex-plugin/plugin.json", errors);
+  const mcp = await parseJson(resolvedRoot, ".mcp.json", errors);
   const hooks = await parseJson(resolvedRoot, "hooks/hooks.json", errors);
 
-  validatePortablePluginManifest(plugin, errors);
-  validateLegacyPluginManifest(legacyPlugin, errors);
+  validatePluginManifest(plugin, errors);
   validateMcpManifest(mcp, errors);
   validateHooksManifest(hooks, errors);
 
-  const skillsPath = portableReference(legacyPlugin?.skills, ".codex-plugin/plugin.json: skills", errors);
-  const hooksPath = portableReference(plugin?.extensions?.["com.openai"]?.hooks, "plugin.json: extensions.com.openai.hooks", errors);
+  const skillsPath = portableReference(plugin?.skills, ".codex-plugin/plugin.json: skills", errors);
+  const mcpPath = portableReference(plugin?.mcpServers, ".codex-plugin/plugin.json: mcpServers", errors);
   await requirePath(resolvedRoot, skillsPath, "directory", errors);
-  await requirePath(resolvedRoot, hooksPath, "file", errors);
-  await requirePath(resolvedRoot, "mcp.json", "file", errors);
+  await requirePath(resolvedRoot, mcpPath, "file", errors);
+  await requirePath(resolvedRoot, "hooks/hooks.json", "file", errors);
   await requirePath(resolvedRoot, "scripts/hook-launcher.mjs", "file", errors);
   await requirePath(resolvedRoot, "scripts/mcp-launcher.mjs", "file", errors);
 
@@ -210,12 +189,10 @@ export async function validatePlugin(root = REPOSITORY_ROOT) {
   }
 
   if (plugin?.version) {
-    if (legacyPlugin?.name !== plugin.name) errors.push(".codex-plugin/plugin.json: name must match plugin.json");
-    if (legacyPlugin?.version !== plugin.version) errors.push(".codex-plugin/plugin.json: version must match plugin.json");
     for (const manifestPath of ["package.json", "server/package.json"]) {
       try {
         const manifest = JSON.parse(await readFile(path.join(resolvedRoot, manifestPath), "utf8"));
-        if (manifest.version !== plugin.version) errors.push(`${manifestPath}: version must match plugin.json`);
+        if (manifest.version !== plugin.version) errors.push(`${manifestPath}: version must match .codex-plugin/plugin.json`);
       } catch (error) {
         if (manifestPath === "server/package.json") errors.push(`${manifestPath}: could not verify version (${error.message})`);
       }

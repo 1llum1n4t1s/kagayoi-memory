@@ -14,6 +14,8 @@ test("package allowlist accepts runtime assets and rejects local state", () => {
   assert.equal(isAllowedPackagePath("server/src/index.ts"), true);
   assert.equal(isAllowedPackagePath("server/migrations/0001_initial.sql"), true);
   assert.equal(isAllowedPackagePath("scripts/setup-server.mjs"), true);
+  assert.equal(isAllowedPackagePath("plugin.json"), false);
+  assert.equal(isAllowedPackagePath("mcp.json"), false);
   assert.equal(isAllowedPackagePath("client/memory-client.test.mjs"), false);
   assert.equal(isAllowedPackagePath("scripts/setup-server.test.mjs"), false);
   assert.equal(isAllowedPackagePath("server/tests/smoke.mjs"), false);
@@ -31,10 +33,9 @@ test("buildPackage creates a clean, valid consumer package", async () => {
     const first = await buildPackage({ output });
     for (const required of [
       ".codex-plugin/plugin.json",
+      ".mcp.json",
       "client/mcp-server.mjs",
       "hooks/hooks.json",
-      "mcp.json",
-      "plugin.json",
       "scripts/setup-client.ps1",
       "scripts/setup-server.mjs",
       "scripts/setup-server.ps1",
@@ -60,12 +61,17 @@ test("buildPackage creates a clean, valid consumer package", async () => {
   }
 });
 
-test("validator rejects machine-specific MCP paths", async () => {
+test("validator requires installed-root MCP cwd and rejects machine-specific paths", async () => {
   const output = testOutput("portable");
   try {
     await buildPackage({ output });
-    const manifestPath = path.join(output, "mcp.json");
+    const manifestPath = path.join(output, ".mcp.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    delete manifest.mcpServers.cloudflare_supermemory.cwd;
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    await assert.rejects(validatePlugin(output), /cwd must be \./u);
+
+    manifest.mcpServers.cloudflare_supermemory.cwd = ".";
     manifest.mcpServers.cloudflare_supermemory.args.push("C:\\Users\\example\\plugin.mjs");
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
     await assert.rejects(validatePlugin(output), /machine-specific or non-portable path/u);
