@@ -6,7 +6,7 @@ The plugin saves completed work in a shared collection and keeps its project fol
 
 ## Requirements
 
-Use Node.js 24, pnpm 11.4.0, a Codex installation with plugin and hook support, and PowerShell 7 for the Windows setup helper. The MCP server and capture hooks have no npm runtime dependencies. The backend needs your own Cloudflare account with Workers, D1, Vectorize, and Workers AI enabled.
+Use Node.js 24.18.0 or later in the 24 series, pnpm 11.4.0, a Codex installation with plugin and hook support, and PowerShell 7 for the Windows setup helper. The MCP server and capture hooks have no npm runtime dependencies. The backend needs your own Cloudflare account with Workers, D1, Vectorize, and Workers AI enabled.
 
 ## Connect an existing server
 
@@ -45,7 +45,7 @@ Keep the local Wrangler configuration for future updates. Never commit generated
 - Manual `add_memory` saves to the shared collection. An absolute `sourceFolder` or a single workspace root supplied by the MCP client adds provenance; an explicit `containerTag` overrides storage. The plugin never uses its installation folder as the user's project. `listSpaces` exposes physical spaces for compatibility and diagnostics.
 - Prompt recall searches every discovered nonempty space by topic. The initial session event does not inject unrelated recent records.
 - Automatic context contains a title, description, section names, timestamps, and document IDs. Codex opens full records with `getDocument` when needed.
-- Capture preserves existing v2 IDs and JSON sent-document receipts, serializes receipt updates through Node's built-in SQLite, redacts configured secrets, and retries unacknowledged records. The small coordination database stays under `cloudflare-memory/capture-state/` in the selected Codex home.
+- Capture redacts configured secrets and retries unacknowledged records. Local capture state stays under `cloudflare-memory/capture-state/` in the selected Codex home.
 - Space discovery is capped by the current server API at 100. A full page is reported as incomplete rather than claiming exhaustive search.
 
 Topics are derived from record content during the existing Workers AI enrichment step. Classification is asynchronous; with AI enrichment disabled or failed, records remain accessible through the unclassified list. Folder names are retained as source metadata. Existing records keep their original document IDs and storage locations and appear in the same topic browser.
@@ -62,25 +62,6 @@ The API key grants access to the records in one server installation. Use separat
 
 This project implements its own Supermemory-compatible API. It is independent of the hosted Supermemory service and does not read or modify Codex's built-in local memory files.
 
-## Repository layout
-
-- `.codex-plugin/`, `.mcp.json`, `hooks/`: Codex plugin manifests and lifecycle hooks
-- `client/`: MCP server, topic recall, capture hooks, and tests
-- `server/`: Cloudflare Worker, D1 migrations, and API tests
-- `scripts/`: portable plugin launchers and setup utilities
-- `skills/setup-cloudflare-memory/`: setup and diagnostics workflow for Codex
-
-## Development
-
-```powershell
-node --test client/*.test.mjs scripts/*.test.mjs
-pnpm -C server install --frozen-lockfile
-pnpm -C server check
-node scripts/validate-plugin.mjs
-node scripts/package-plugin.mjs
-git diff --check
-```
-
-Server tests use local D1 and deterministic AI/vector fixtures. Provisioning tests simulate Wrangler calls; they do not create remote resources. A clean package is written to `dist/cloudflare-supermemory`. CI runs the checks and uploads that package as an artifact. A release tag or package-registry publication is a separate operation.
+For architecture and repository layout, see [DESIGN.md](DESIGN.md). Contributor constraints, validation, and packaging commands are in [AGENTS.md](AGENTS.md).
 
 Licensed under the [MIT License](LICENSE).
