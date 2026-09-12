@@ -1,6 +1,6 @@
 {
   "name": "kagayoi-memory",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Self-hosted, topic-based memory for Codex on Cloudflare",
   "author": {
     "name": "Kagayoi",

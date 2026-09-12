@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.3 - 2026-09-12
+
 ### 変更
 
 - 製品名を **Kagayoi Memory**、CodexプラグインIDと配布名を `kagayoi-memory`、セットアップSkill名を `setup-kagayoi-memory` に統一しました。
