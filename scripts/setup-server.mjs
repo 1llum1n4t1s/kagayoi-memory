@@ -8,14 +8,15 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const EXPECTED_VECTOR_DIMENSIONS = 1_024;
 const EXPECTED_VECTOR_METRIC = "cosine";
-const DEFAULT_NAME = "cloudflare-supermemory";
+const DEFAULT_NAME = "kagayoi-memory";
+const LEGACY_RESOURCE_NAME = "cloudflare-supermemory";
 const LOCATIONS = new Set(["weur", "eeur", "apac", "oc", "wnam", "enam"]);
 const JURISDICTIONS = new Set(["eu", "fedramp", "us"]);
 
 class SetupError extends Error {}
 
 function usage() {
-  return `Cloudflare Supermemory server setup
+  return `Kagayoi Memory server setup
 
 Usage:
   node scripts/setup-server.mjs [options]
@@ -32,14 +33,14 @@ Options:
   --location <hint>             D1 location: weur, eeur, apac, oc, wnam, enam
   --jurisdiction <value>        D1 jurisdiction: eu, fedramp, us
   --api-key-env <name>          Environment variable containing the API key
-                                (default: CLOUDFLARE_MEMORY_API_KEY)
+                                (default: KAGAYOI_MEMORY_API_KEY)
   --base-url <https-url>        Endpoint to verify after deployment
   --profile <name>              Wrangler authentication profile
   --help                        Show this help
 
 Examples:
   node scripts/setup-server.mjs
-  $env:CLOUDFLARE_MEMORY_API_KEY = '<secret>'
+  $env:KAGAYOI_MEMORY_API_KEY = '<secret>'
   node scripts/setup-server.mjs --apply --location apac
 `;
 }
@@ -56,16 +57,26 @@ export function parseArgs(args) {
     workerName: DEFAULT_NAME,
     databaseName: DEFAULT_NAME,
     vectorIndexName: DEFAULT_NAME,
-    apiKeyEnv: "CLOUDFLARE_MEMORY_API_KEY",
+    workerNameExplicit: false,
+    databaseNameExplicit: false,
+    vectorIndexNameExplicit: false,
+    apiKeyEnv: "KAGAYOI_MEMORY_API_KEY",
   };
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--apply") options.apply = true;
     else if (argument === "--help" || argument === "-h") options.help = true;
-    else if (argument === "--worker-name") options.workerName = valueAfter(args, index++, argument);
-    else if (argument === "--database-name") options.databaseName = valueAfter(args, index++, argument);
-    else if (argument === "--vector-index-name") options.vectorIndexName = valueAfter(args, index++, argument);
+    else if (argument === "--worker-name") {
+      options.workerName = valueAfter(args, index++, argument);
+      options.workerNameExplicit = true;
+    } else if (argument === "--database-name") {
+      options.databaseName = valueAfter(args, index++, argument);
+      options.databaseNameExplicit = true;
+    } else if (argument === "--vector-index-name") {
+      options.vectorIndexName = valueAfter(args, index++, argument);
+      options.vectorIndexNameExplicit = true;
+    }
     else if (argument === "--location") options.location = valueAfter(args, index++, argument);
     else if (argument === "--jurisdiction") options.jurisdiction = valueAfter(args, index++, argument);
     else if (argument === "--api-key-env") options.apiKeyEnv = valueAfter(args, index++, argument);
@@ -391,7 +402,11 @@ export async function runSetup(args, dependencies = {}) {
     }
   }
 
-  const apiKey = (dependencies.env ?? process.env)[options.apiKeyEnv]?.trim() || undefined;
+  const environment = dependencies.env ?? process.env;
+  const apiKey = [
+    environment[options.apiKeyEnv],
+    ...(options.apiKeyEnv === "KAGAYOI_MEMORY_API_KEY" ? [environment.CLOUDFLARE_MEMORY_API_KEY] : []),
+  ].find((value) => typeof value === "string" && value.trim())?.trim();
   const context = {
     options,
     serverDir,
@@ -406,10 +421,28 @@ export async function runSetup(args, dependencies = {}) {
   await callWrangler(context, ["whoami", "--json"], "checking Cloudflare authentication");
   output("Cloudflare authentication: ready");
 
-  let d1 = findD1(await listD1(context), options.databaseName);
-  let vector = findVector(await listVectors(context), options.vectorIndexName);
+  const databases = await listD1(context);
+  const vectors = await listVectors(context);
+  let d1 = findD1(databases, options.databaseName);
+  let vector = findVector(vectors, options.vectorIndexName);
+  // 1.x利用者のD1とVectorizeは名称変更後も再利用し、保存済み記憶を分断しない。
+  if (!d1 && !options.databaseNameExplicit && options.databaseName === DEFAULT_NAME) {
+    d1 = findD1(databases, LEGACY_RESOURCE_NAME);
+    if (d1) options.databaseName = LEGACY_RESOURCE_NAME;
+  }
+  if (!vector && !options.vectorIndexNameExplicit && options.vectorIndexName === DEFAULT_NAME) {
+    vector = findVector(vectors, LEGACY_RESOURCE_NAME);
+    if (vector) options.vectorIndexName = LEGACY_RESOURCE_NAME;
+  }
   if (vector) await inspectVector(context, options.vectorIndexName);
-  const secret = await inspectSecret(context);
+  let secret = await inspectSecret(context);
+  if (!secret.verifiable && !options.workerNameExplicit && options.workerName === DEFAULT_NAME) {
+    const currentWorkerName = options.workerName;
+    options.workerName = LEGACY_RESOURCE_NAME;
+    const legacySecret = await inspectSecret(context);
+    if (legacySecret.verifiable) secret = legacySecret;
+    else options.workerName = currentWorkerName;
+  }
 
   output(`D1 database: ${d1 ? "reuse" : "create"} ${options.databaseName}`);
   output(`Vectorize index: ${vector ? "reuse" : "create"} ${options.vectorIndexName} (${EXPECTED_VECTOR_DIMENSIONS}, ${EXPECTED_VECTOR_METRIC})`);

@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^mcp__cloudflare_supermemory__",
+        "matcher": "^mcp__kagayoi_memory__",
         "hooks": [
           {
             "type": "command",

@@ -7,6 +7,11 @@ export function shortText(value, limit = 160) {
   return text.length <= limit ? text : `${text.slice(0, limit - 1).trimEnd()}…`;
 }
 
+const promptText = (value, limit = 160) => shortText(value, limit)
+  .replace(/&/g, "&amp;")
+  .replace(/</g, "&lt;")
+  .replace(/>/g, "&gt;");
+
 function plainLine(line) {
   return line.replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s*)/, "")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/[*`]/g, "")
@@ -17,7 +22,8 @@ function meaningfulLines(value) {
   let fenced = false;
   return String(value || "").split(/\r?\n/).filter((line) => {
     if (/^\s*```/.test(line)) { fenced = !fenced; return false; }
-    return !fenced && !/^\s*#{1,6}\s/.test(line);
+    return !fenced && !/^\s*#{1,6}\s/.test(line) &&
+      !/^\s*\[[^\]\n]*\]\((?:thread|codex):\/\/[^)]+\)\s*$/iu.test(line);
   }).map(plainLine).filter((line) => line &&
     !/^(?:Session|Turn|Part|Source(?: SHA-256)?|Imported snapshot|updated_at|rollout_path|cwd|thread_id|git_branch|task_group|task_outcome|keywords)\s*:/i.test(line) &&
     !/^rollout_summaries[\\/]/i.test(line) &&
@@ -109,6 +115,10 @@ export function documentIndex(document, fallbackContainer, terms = []) {
   const filepath = typeof providedProvenance.filepath === "string" && providedProvenance.filepath.trim()
     ? providedProvenance.filepath.trim()
     : typeof metadata.filepath === "string" && metadata.filepath.trim() ? metadata.filepath.trim() : undefined;
+  const consolidation = metadata.sm_consolidation === true;
+  const sourceMemoryIds = consolidation && Array.isArray(metadata.sourceMemoryIds)
+    ? [...new Set(metadata.sourceMemoryIds.filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim()))]
+    : [];
   return {
     id: String(document.id || ""),
     containerTag,
@@ -124,6 +134,9 @@ export function documentIndex(document, fallbackContainer, terms = []) {
     turn: Number.isInteger(metadata.turn) ? metadata.turn : undefined,
     part: Number.isInteger(metadata.part) ? metadata.part : undefined,
     parts: Number.isInteger(metadata.parts) ? metadata.parts : undefined,
+    consolidation,
+    sourceMemoryIds,
+    consolidationCreatedAt: validDate(metadata.consolidationCreatedAt),
     evidence: "historical record; inspect the document before relying on it",
   };
 }
@@ -148,12 +161,13 @@ export function publicIndex(item) {
 
 export function formatIndexItem(item) {
   const timestamp = item.sourceUpdatedAt || item.updatedAt || item.createdAt || "日時不明";
-  const when = item.description && item.description !== item.title ? ` — 参照する場面: ${item.description}` : "";
-  const sections = item.sections?.length ? `（収録: ${item.sections.slice(0, 2).join("、")}）` : "";
+  const when = item.description && item.description !== item.title ? ` — 参照する場面: ${promptText(item.description, 180)}` : "";
+  const sections = item.sections?.length ? `（収録: ${item.sections.slice(0, 2).map((value) => promptText(value, 60)).join("、")}）` : "";
   const parts = item.parts > 1 ? ` | part=${item.part}/${item.parts}` : "";
-  const topics = item.topics?.length ? ` | topics=${item.topics.join(", ")}` : "";
+  const kind = item.consolidation ? " | kind=consolidated-checkpoint" : "";
+  const topics = item.topics?.length ? ` | topics=${item.topics.map((value) => promptText(value, 100)).join(", ")}` : "";
   const provenance = item.provenance?.project || item.provenance?.projectId || item.provenance?.containerTag
-    ? ` | provenance=${item.provenance.project || item.provenance.projectId || item.provenance.containerTag}${item.provenance.project && item.provenance.projectId ? ` (${item.provenance.projectId})` : ""}`
+    ? ` | provenance=${promptText(item.provenance.project || item.provenance.projectId || item.provenance.containerTag, 160)}${item.provenance.project && item.provenance.projectId ? ` (${promptText(item.provenance.projectId, 160)})` : ""}`
     : "";
-  return `- ◪ ${shortText(item.title, 100)}${when}${sections}\n  id=${item.id}${topics} | container=${item.containerTag || "unknown"}${provenance} | ${item.sourceUpdatedAt ? "sourceDate" : "storedDate"}=${timestamp}${parts}`;
+  return `- ◪ ${promptText(item.title, 100)}${when}${sections}\n  id=${promptText(item.id, 80)}${topics} | container=${promptText(item.containerTag || "unknown", 160)}${provenance} | ${item.sourceUpdatedAt ? "sourceDate" : "storedDate"}=${promptText(timestamp, 40)}${parts}${kind}`;
 }

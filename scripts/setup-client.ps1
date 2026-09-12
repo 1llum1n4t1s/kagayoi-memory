@@ -19,26 +19,31 @@ if (-not (Test-Path -LiteralPath $resolvedHome -PathType Container)) {
     New-Item -ItemType Directory -Path $resolvedHome | Out-Null
 }
 
-$configPath = Join-Path $resolvedHome 'supermemory.json'
+$configPath = Join-Path $resolvedHome 'kagayoi-memory.json'
+$legacyConfigPath = Join-Path $resolvedHome 'supermemory.json'
+$sourceConfigPath = if (Test-Path -LiteralPath $configPath -PathType Leaf) { $configPath } elseif (Test-Path -LiteralPath $legacyConfigPath -PathType Leaf) { $legacyConfigPath } else { $configPath }
 $existingConfig = [ordered]@{}
-if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+if (Test-Path -LiteralPath $sourceConfigPath -PathType Leaf) {
     try {
-        $parsedConfig = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json -AsHashtable
+        $parsedConfig = Get-Content -Raw -LiteralPath $sourceConfigPath | ConvertFrom-Json -AsHashtable
         if ($null -eq $parsedConfig) { throw 'empty configuration' }
         foreach ($entry in $parsedConfig.GetEnumerator()) { $existingConfig[$entry.Key] = $entry.Value }
     } catch {
-        if (-not $Force) { throw "Configuration at $configPath is invalid. Use -Force to replace it." }
+        if (-not $Force) { throw "Configuration at $sourceConfigPath is invalid. Use -Force to replace it." }
         $existingConfig = [ordered]@{}
     }
 }
 
+if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
+    $BaseUrl = [Environment]::GetEnvironmentVariable('KAGAYOI_MEMORY_API_URL', 'Process')
+}
 if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
     $BaseUrl = [Environment]::GetEnvironmentVariable('SUPERMEMORY_API_URL', 'Process')
 }
 if ([string]::IsNullOrWhiteSpace($BaseUrl) -and $existingConfig.Contains('baseUrl')) {
     $BaseUrl = [string]$existingConfig.baseUrl
 }
-if ([string]::IsNullOrWhiteSpace($BaseUrl)) { throw 'BaseUrl or SUPERMEMORY_API_URL is required.' }
+if ([string]::IsNullOrWhiteSpace($BaseUrl)) { throw 'BaseUrl or KAGAYOI_MEMORY_API_URL is required.' }
 
 try { $endpoint = [Uri]$BaseUrl } catch { throw 'BaseUrl must be an absolute URL.' }
 $endpointHost = $endpoint.DnsSafeHost.Trim('[', ']').ToLowerInvariant()
@@ -52,7 +57,10 @@ if (-not $endpoint.IsAbsoluteUri -or $endpoint.UserInfo -or $endpoint.Query -or 
 }
 $normalizedUrl = $endpoint.AbsoluteUri.TrimEnd('/')
 
-$apiKey = [Environment]::GetEnvironmentVariable('SUPERMEMORY_CODEX_API_KEY', 'Process')
+$apiKey = [Environment]::GetEnvironmentVariable('KAGAYOI_MEMORY_API_KEY', 'Process')
+if ([string]::IsNullOrWhiteSpace($apiKey)) {
+    $apiKey = [Environment]::GetEnvironmentVariable('SUPERMEMORY_CODEX_API_KEY', 'Process')
+}
 if ([string]::IsNullOrWhiteSpace($apiKey)) {
     $apiKey = [Environment]::GetEnvironmentVariable('CLOUDFLARE_MEMORY_API_KEY', 'Process')
 }
@@ -88,6 +96,9 @@ $temporaryPath = "$configPath.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
 try {
     [System.IO.File]::WriteAllText($temporaryPath, ($config | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::Move($temporaryPath, $configPath, $true)
+    if ($sourceConfigPath -eq $legacyConfigPath -and (Test-Path -LiteralPath $legacyConfigPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $legacyConfigPath -Force
+    }
 } finally {
     if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force }
 }

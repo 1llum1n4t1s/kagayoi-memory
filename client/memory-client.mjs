@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
-import { getProjectContext, loadConfig } from "./Import-CodexSupermemoryHistory.mjs";
+import { CONFIG_FILE_NAME, LEGACY_CONFIG_FILE_NAME, getProjectContext, loadConfig } from "./Import-KagayoiMemoryHistory.mjs";
 import { documentIndex, formatIndexItem, publicIndex } from "./memory-index.mjs";
 
 const hash = (text) => createHash("sha256").update(text).digest("hex").slice(0, 16);
@@ -15,8 +15,11 @@ function git(args, cwd) {
 
 export function readSettings(codexHome = process.env.CODEX_HOME || join(homedir(), ".codex")) {
   let config = {};
-  try { config = JSON.parse(readFileSync(join(codexHome, "supermemory.json"), "utf8")); }
-  catch { /* 認証のエラーはAPI接続時に通知する。 */ }
+  try { config = JSON.parse(readFileSync(join(codexHome, CONFIG_FILE_NAME), "utf8")); }
+  catch {
+    try { config = JSON.parse(readFileSync(join(codexHome, LEGACY_CONFIG_FILE_NAME), "utf8")); }
+    catch { /* 認証のエラーはAPI接続時に通知する。 */ }
+  }
   return {
     codexHome,
     recallMode: config.recallMode || "direct",
@@ -29,7 +32,7 @@ export function readSettings(codexHome = process.env.CODEX_HOME || join(homedir(
   };
 }
 
-// project由来tagは出典と旧Supermemory空間の検索用別名として扱い、新規保存は共通containerへ集約する。
+// project由来tagは出典と旧形式空間の検索用別名として扱い、新規保存は共通containerへ集約する。
 // Codex公式のmemoriesディレクトリや生成物を開く処理は持たない。
 export function getReadContext(cwd = process.cwd(), settings = readSettings()) {
   const project = getProjectContext(cwd);
@@ -55,11 +58,11 @@ export async function api(path, { body, method = body ? "POST" : "GET", timeoutM
   const response = await fetchImpl(`${config.baseUrl}${path}`, {
     method,
     redirect: "error",
-    headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json", "x-sm-source": "codex-cloudflare" },
+    headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json", "x-sm-source": "codex-kagayoi-memory" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(timeoutMs),
   });
-  if (!response.ok) throw new Error(`Cloudflare memory API request failed (HTTP ${response.status})`);
+  if (!response.ok) throw new Error(`Kagayoi Memory API request failed (HTTP ${response.status})`);
   return response.status === 204 ? null : response.json();
 }
 
@@ -106,9 +109,9 @@ export async function discoverSearchContainers(request = api) {
   try {
     response = await request("/v3/container-tags");
   } catch (error) {
-    throw new Error("Supermemory space discovery failed; global topic search was not performed", { cause: error });
+    throw new Error("Kagayoi Memory space discovery failed; global topic search was not performed", { cause: error });
   }
-  if (!Array.isArray(response?.spaces)) throw new Error("Supermemory space discovery returned an invalid response; global topic search was not performed");
+  if (!Array.isArray(response?.spaces)) throw new Error("Kagayoi Memory space discovery returned an invalid response; global topic search was not performed");
   const tags = unique(response.spaces.filter((space) => {
     if (!space || typeof space !== "object" || typeof space.containerTag !== "string") return false;
     return space.memoryCount === undefined || Number(space.memoryCount) > 0;
@@ -143,7 +146,7 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
     return response.results.map((row, rank) => ({ row, rank, index: documentIndex(row, tag) }));
   });
   const failedTags = tags.filter((_, i) => results[i].status === "rejected");
-  if (tags.length && failedTags.length === tags.length) throw new Error("Supermemory search unavailable for all requested spaces");
+  if (tags.length && failedTags.length === tags.length) throw new Error("Kagayoi Memory search unavailable for all requested spaces");
   const terms = queryTerms(query);
   const rawCandidates = results.flatMap((r) => r.status === "fulfilled" ? r.value : []).filter(({ row, index }) => {
     if (!index.id || !index.containerTag) return false;
@@ -172,11 +175,18 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
   const hydrated = hydratedResults.filter((result) => result.status === "fulfilled").map((result) => result.value);
   const eligible = hydrated.filter(({ row, index }) =>
     semanticEligible(row, settings.minimumSimilarity) || lexicalEligible(row) || topicRelevance(index, terms) > 0);
-  const candidates = eligible.filter(({ index }) =>
+  let candidates = eligible.filter(({ index }) =>
     !automatic || index.recallable && topicRelevance(index, terms) > 0);
+  if (automatic) {
+    const coveredSourceIds = new Set(candidates.filter(({ index }) => index.consolidation)
+      .flatMap(({ index }) => index.sourceMemoryIds));
+    candidates = candidates.filter(({ index }) => index.consolidation || !coveredSourceIds.has(index.id));
+  }
   candidates.sort((a, b) => {
     const topicDifference = topicRelevance(b.index, terms) - topicRelevance(a.index, terms);
-    return topicDifference || Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank ||
+    const consolidationDifference = automatic ? Number(b.index.consolidation) - Number(a.index.consolidation) : 0;
+    return consolidationDifference || topicDifference || Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank ||
+      String(b.index.consolidationCreatedAt || "").localeCompare(String(a.index.consolidationCreatedAt || "")) ||
       String(b.index.sourceUpdatedAt || b.index.updatedAt || "").localeCompare(String(a.index.sourceUpdatedAt || a.index.updatedAt || ""));
   });
   const documents = [];

@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { api, loadConfig, getProjectContext, listJsonlFiles, readSessionMeta,
-  chooseCandidates, parseTaskTranscript, readTaskTitles, buildTurnDocuments, sanitizeText } from "./Import-CodexSupermemoryHistory.mjs";
+  chooseCandidates, parseTaskTranscript, readTaskTitles, buildTurnDocuments, sanitizeText } from "./Import-KagayoiMemoryHistory.mjs";
 
 export async function findTranscript(payload, codexHome) {
   if (!payload.session_id) throw new Error("Missing session ID.");
@@ -32,7 +32,15 @@ function readReceipts(statePath) {
   return new Set(state);
 }
 
-async function recordReceipt(statePath, customId) {
+function readReceiptUnion(...statePaths) {
+  const receipts = new Set();
+  for (const statePath of statePaths) {
+    for (const receipt of readReceipts(statePath)) receipts.add(receipt);
+  }
+  return receipts;
+}
+
+async function recordReceipt(statePath, legacyStatePath, customId) {
   // Node 24標準SQLiteを保存処理の短い排他だけに使い、送信済み記録の正本は既存JSONのまま保つ。
   const { DatabaseSync } = await import("node:sqlite");
   const databasePath = join(dirname(statePath), "capture-coordination.sqlite3");
@@ -45,7 +53,8 @@ async function recordReceipt(statePath, customId) {
     database.exec("BEGIN IMMEDIATE");
     transactionOpen = true;
     database.prepare("UPDATE capture_mutex SET touched_at = ? WHERE id = 1").run(Date.now());
-    const receipts = readReceipts(statePath);
+    // 初回の新形式書込みでも旧レシートを統合し、次回から旧turnが再送されないようにする。
+    const receipts = readReceiptUnion(statePath, legacyStatePath);
     receipts.add(customId);
     const temporary = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
     try {
@@ -77,10 +86,12 @@ export async function capture(payload, { codexHome = process.env.CODEX_HOME || j
   const title = sanitizeText(titles.get(candidate.meta.id) || "", [config.apiKey], { count: 0 });
   const documents = buildTurnDocuments(candidate, transcript, project, title);
   // 応答を確認した文書だけ記録する。中断後の再送も同じcustomIdなので上書き損失は起きない。
-  const stateDirectory = join(codexHome, "cloudflare-memory", "capture-state");
+  const stateDirectory = join(codexHome, "kagayoi-memory", "capture-state");
+  const legacyStateDirectory = join(codexHome, "cloudflare-memory", "capture-state");
   const stateId = createHash("sha256").update(`${config.baseUrl}:${project.containerTag}:${candidate.meta.id}`).digest("hex");
   const statePath = join(stateDirectory, `${stateId}.json`);
-  const receipts = readReceipts(statePath);
+  const legacyStatePath = join(legacyStateDirectory, `${stateId}.json`);
+  const receipts = readReceiptUnion(statePath, legacyStatePath);
   const pending = documents.filter((document) => !receipts.has(document.customId));
   const started = Date.now();
   let saved = 0;
@@ -90,7 +101,7 @@ export async function capture(payload, { codexHome = process.env.CODEX_HOME || j
     if (!result || typeof result.id !== "string" || !result.id) throw new Error("Memory API did not acknowledge the document.");
     receipts.add(document.customId);
     mkdirSync(stateDirectory, { recursive: true });
-    await recordReceipt(statePath, document.customId);
+    await recordReceipt(statePath, legacyStatePath, document.customId);
     saved += 1;
   }
   return { saved, pending: pending.length - saved, completedTurns: transcript.turns.length };
@@ -101,11 +112,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const payload = JSON.parse(readFileSync(0, "utf8"));
     const result = await capture(payload);
     if (result.saved || result.pending) process.stdout.write(JSON.stringify({
-      systemMessage: `Supermemory: saved ${result.saved} documents; pending ${result.pending}.`,
+      systemMessage: `Kagayoi Memory: saved ${result.saved} documents; pending ${result.pending}.`,
     }));
   } catch {
     // 本文・接続設定・HTTP応答をログへ出さず、失敗は呼び出し元に通知する。
-    process.stderr.write("Supermemory capture failed; unacknowledged records will be retried.\n");
+    process.stderr.write("Kagayoi Memory capture failed; unacknowledged records will be retried.\n");
     process.exitCode = 1;
   }
 }

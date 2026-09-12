@@ -9,7 +9,7 @@ import { parseArgs, runSetup } from "./setup-server.mjs";
 const API_KEY = "test-only-api-key-that-must-not-appear";
 
 async function fixture(existingConfig) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "cloudflare-memory-setup-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "kagayoi-memory-setup-"));
   const serverDir = path.join(root, "server");
   const wranglerBin = path.join(serverDir, "node_modules", "wrangler", "bin", "wrangler.js");
   await mkdir(path.dirname(wranglerBin), { recursive: true });
@@ -21,12 +21,12 @@ async function fixture(existingConfig) {
     path.join(serverDir, "wrangler.example.jsonc"),
     JSON.stringify({
       $schema: "./node_modules/wrangler/config-schema.json",
-      name: "cloudflare-supermemory",
+      name: "kagayoi-memory",
       main: "src/index.ts",
       compatibility_date: "2026-09-02",
       workers_dev: true,
       preview_urls: false,
-      triggers: { crons: ["*/15 * * * *"] },
+      triggers: { crons: ["*/15 * * * *", "0 18 * * *"] },
       vars: { AI_ENRICHMENT_MODE: "on" },
       ai: { binding: "AI" },
       vectorize: [],
@@ -46,6 +46,8 @@ function mockCloudflare(overrides = {}) {
     d1CreateCode: overrides.d1CreateCode ?? 0,
     vectorCreateCode: overrides.vectorCreateCode ?? 0,
     secretPutCode: overrides.secretPutCode ?? 0,
+    resourceName: overrides.resourceName ?? "kagayoi-memory",
+    workerName: overrides.workerName ?? "kagayoi-memory",
   };
   const calls = [];
   const runner = async ({ args, input }) => {
@@ -53,24 +55,24 @@ function mockCloudflare(overrides = {}) {
     const command = args.join(" ");
     if (command.startsWith("whoami --json")) return { code: 0, stdout: '{"email":"user@example.test"}', stderr: "" };
     if (command.startsWith("d1 list --json")) {
-      return { code: 0, stdout: JSON.stringify(state.d1 ? [{ name: "cloudflare-supermemory", uuid: state.d1 }] : []), stderr: "" };
+      return { code: 0, stdout: JSON.stringify(state.d1 ? [{ name: state.resourceName, uuid: state.d1 }] : []), stderr: "" };
     }
-    if (command.startsWith("d1 create cloudflare-supermemory")) {
+    if (command.startsWith("d1 create kagayoi-memory")) {
       state.d1 = state.d1 ?? "11111111-1111-1111-1111-111111111111";
       return { code: state.d1CreateCode, stdout: "created", stderr: state.d1CreateCode ? "already exists" : "" };
     }
     if (command.startsWith("vectorize list --json")) {
-      return { code: 0, stdout: JSON.stringify(state.vector ? [{ name: "cloudflare-supermemory" }] : []), stderr: "" };
+      return { code: 0, stdout: JSON.stringify(state.vector ? [{ name: state.resourceName }] : []), stderr: "" };
     }
-    if (command.startsWith("vectorize create cloudflare-supermemory")) {
+    if (command.startsWith("vectorize create kagayoi-memory")) {
       state.vector = state.vector ?? { dimensions: 1024, metric: "cosine" };
       return { code: state.vectorCreateCode, stdout: "{}", stderr: state.vectorCreateCode ? "already exists" : "" };
     }
-    if (command.startsWith("vectorize get cloudflare-supermemory --json")) {
-      return { code: 0, stdout: JSON.stringify({ name: "cloudflare-supermemory", config: state.vector }), stderr: "" };
+    if (command.startsWith(`vectorize get ${state.resourceName} --json`)) {
+      return { code: 0, stdout: JSON.stringify({ name: state.resourceName, config: state.vector }), stderr: "" };
     }
-    if (command.startsWith("secret list --name cloudflare-supermemory --format json")) {
-      if (!state.secretVerifiable) return { code: 1, stdout: "", stderr: "Worker does not exist" };
+    if (command.startsWith("secret list --name ")) {
+      if (args[3] !== state.workerName || !state.secretVerifiable) return { code: 1, stdout: "", stderr: "Worker does not exist" };
       return {
         code: 0,
         stdout: JSON.stringify(state.secretPresent ? [{ name: "MEMORY_API_KEY", type: "secret_text" }] : []),
@@ -88,7 +90,7 @@ function mockCloudflare(overrides = {}) {
     }
     if (command.startsWith("d1 migrations apply DB --remote")) return { code: 0, stdout: "migrated", stderr: "" };
     if (command.startsWith("deploy --minify")) {
-      return { code: 0, stdout: "Deployed https://cloudflare-supermemory.example.workers.dev", stderr: "" };
+      return { code: 0, stdout: "Deployed https://kagayoi-memory.example.workers.dev", stderr: "" };
     }
     throw new Error(`Unexpected mock Wrangler command: ${command}`);
   };
@@ -117,7 +119,7 @@ test("default dry run performs discovery without creating resources or writing c
   assert.equal(cloudflare.calls.some(({ args }) => args.includes("create") || args.includes("deploy")), false);
   await assert.rejects(readFile(path.join(files.serverDir, "wrangler.jsonc")), { code: "ENOENT" });
   assert.match(lines.join("\n"), /pass --apply/);
-  assert.match(lines.join("\n"), /set CLOUDFLARE_MEMORY_API_KEY/);
+  assert.match(lines.join("\n"), /set KAGAYOI_MEMORY_API_KEY/);
 });
 
 test("apply creates missing resources, writes config, migrates, deploys, and verifies", async (t) => {
@@ -128,7 +130,7 @@ test("apply creates missing resources, writes config, migrates, deploys, and ver
   const requests = [];
   const result = await runSetup(["--apply", "--location", "apac"], {
     ...files,
-    env: { CLOUDFLARE_MEMORY_API_KEY: API_KEY },
+    env: { KAGAYOI_MEMORY_API_KEY: API_KEY },
     runner: cloudflare.runner,
     output: (line) => lines.push(line),
     fetchImpl: async (url, init) => {
@@ -142,14 +144,14 @@ test("apply creates missing resources, writes config, migrates, deploys, and ver
   assert.equal(result.mode, "apply");
   const config = JSON.parse(await readFile(path.join(files.serverDir, "wrangler.jsonc"), "utf8"));
   assert.equal(config.d1_databases[0].database_id, "11111111-1111-1111-1111-111111111111");
-  assert.equal(config.vectorize[0].index_name, "cloudflare-supermemory");
+  assert.equal(config.vectorize[0].index_name, "kagayoi-memory");
   assert.equal("secrets" in config, false);
-  assert.ok(cloudflare.calls.some(({ args }) => args.join(" ").includes("d1 create cloudflare-supermemory --location apac")));
+  assert.ok(cloudflare.calls.some(({ args }) => args.join(" ").includes("d1 create kagayoi-memory --location apac")));
   assert.ok(cloudflare.calls.some(({ args }) => args.join(" ").startsWith("d1 migrations apply DB --remote")));
   assert.ok(cloudflare.calls.some(({ args }) => args.join(" ").startsWith("deploy --minify")));
   assert.deepEqual(requests, [
-    { url: "https://cloudflare-supermemory.example.workers.dev/health", authorization: undefined },
-    { url: "https://cloudflare-supermemory.example.workers.dev/v3/session", authorization: `Bearer ${API_KEY}` },
+    { url: "https://kagayoi-memory.example.workers.dev/health", authorization: undefined },
+    { url: "https://kagayoi-memory.example.workers.dev/v3/session", authorization: `Bearer ${API_KEY}` },
   ]);
   assert.doesNotMatch(lines.join("\n"), new RegExp(API_KEY));
 });
@@ -189,13 +191,73 @@ test("existing resources and secret are reused while custom config fields are pr
   assert.deepEqual(config.routes, [{ pattern: "memory.example.test", custom_domain: true }]);
   assert.equal(config.vars.CUSTOM, "kept");
   assert.equal(config.vars.AI_ENRICHMENT_MODE, "on");
-  assert.deepEqual(config.triggers.crons, ["*/15 * * * *"]);
+  assert.deepEqual(config.triggers.crons, ["*/15 * * * *", "0 18 * * *"]);
   assert.equal(config.compatibility_date, "2026-09-02");
   assert.equal(config.vectorize.length, 2);
   assert.equal(config.d1_databases.length, 2);
   assert.equal(cloudflare.calls.some(({ args }) => args[0] === "secret" && args[1] === "put"), false);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].url.endsWith("/health"), true);
+});
+
+test("1.x resource names are reused instead of creating an empty replacement store", async (t) => {
+  const files = await fixture();
+  t.after(() => rm(files.root, { recursive: true, force: true }));
+  const cloudflare = mockCloudflare({
+    resourceName: "cloudflare-supermemory",
+    workerName: "cloudflare-supermemory",
+    d1: "44444444-4444-4444-4444-444444444444",
+    vector: { dimensions: 1024, metric: "cosine" },
+    secretVerifiable: true,
+    secretPresent: true,
+  });
+
+  await runSetup(["--apply"], {
+    ...files,
+    env: {},
+    runner: cloudflare.runner,
+    output: () => {},
+    fetchImpl: async () => ({ ok: true, status: 200 }),
+    nodeVersion: "24.0.0",
+  });
+
+  const config = JSON.parse(await readFile(path.join(files.serverDir, "wrangler.jsonc"), "utf8"));
+  assert.equal(config.d1_databases[0].database_name, "cloudflare-supermemory");
+  assert.equal(config.vectorize[0].index_name, "cloudflare-supermemory");
+  assert.equal(config.name, "cloudflare-supermemory");
+  assert.equal(cloudflare.calls.some(({ args }) => args.includes("create")), false);
+});
+
+test("explicit Kagayoi Memory resource names are not replaced by discovered 1.x resources", async (t) => {
+  const files = await fixture();
+  t.after(() => rm(files.root, { recursive: true, force: true }));
+  const cloudflare = mockCloudflare({
+    resourceName: "cloudflare-supermemory",
+    workerName: "cloudflare-supermemory",
+    d1: "44444444-4444-4444-4444-444444444444",
+    vector: { dimensions: 1024, metric: "cosine" },
+    secretVerifiable: true,
+    secretPresent: true,
+  });
+
+  const lines = [];
+  const result = await runSetup([
+    "--worker-name", "kagayoi-memory",
+    "--database-name", "kagayoi-memory",
+    "--vector-index-name", "kagayoi-memory",
+  ], {
+    ...files,
+    env: {},
+    runner: cloudflare.runner,
+    output: (line) => lines.push(line),
+    nodeVersion: "24.0.0",
+  });
+
+  assert.equal(result.d1, false);
+  assert.equal(result.vector, false);
+  assert.equal(result.secret.verifiable, false);
+  assert.match(lines.join("\n"), /D1 database: create kagayoi-memory/);
+  assert.match(lines.join("\n"), /Vectorize index: create kagayoi-memory/);
 });
 
 test("apply fails before mutations when no existing or supplied Worker secret is available", async (t) => {
@@ -211,7 +273,7 @@ test("apply fails before mutations when no existing or supplied Worker secret is
       output: () => {},
       nodeVersion: "24.0.0",
     }),
-    /Set CLOUDFLARE_MEMORY_API_KEY/,
+    /Set KAGAYOI_MEMORY_API_KEY/,
   );
   assert.equal(cloudflare.calls.some(({ args }) => args.includes("create") || args.includes("deploy")), false);
 });
@@ -227,7 +289,7 @@ test("an incompatible existing Vectorize index is rejected before changes", asyn
   await assert.rejects(
     runSetup(["--apply"], {
       ...files,
-      env: { CLOUDFLARE_MEMORY_API_KEY: API_KEY },
+      env: { KAGAYOI_MEMORY_API_KEY: API_KEY },
       runner: cloudflare.runner,
       output: () => {},
       nodeVersion: "24.0.0",
@@ -237,7 +299,7 @@ test("an incompatible existing Vectorize index is rejected before changes", asyn
   await assert.rejects(readFile(path.join(files.serverDir, "wrangler.jsonc")), { code: "ENOENT" });
 });
 
-test("rerun-safe discovery recovers when create reports a conflict", async (t) => {
+test("rerun-safe discovery accepts the 1.x key alias and recovers when create reports a conflict", async (t) => {
   const files = await fixture();
   t.after(() => rm(files.root, { recursive: true, force: true }));
   const cloudflare = mockCloudflare({ d1CreateCode: 1 });
@@ -263,7 +325,7 @@ test("a failed secret update never includes the secret value in the error", asyn
   try {
     await runSetup(["--apply"], {
       ...files,
-      env: { CLOUDFLARE_MEMORY_API_KEY: API_KEY },
+      env: { KAGAYOI_MEMORY_API_KEY: API_KEY },
       runner: cloudflare.runner,
       output: () => {},
       sleep: async () => {},

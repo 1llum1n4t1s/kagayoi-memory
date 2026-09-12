@@ -9,6 +9,7 @@ function d1Adapter(database) {
   let beforeFirst;
   let beforeAll;
   let beforeRun;
+  let beforeBatch;
 
   function prepare(sql) {
     const operation = (values = []) => ({
@@ -43,6 +44,7 @@ function d1Adapter(database) {
   return {
     prepare,
     batch: async (operations) => {
+      if (beforeBatch) await beforeBatch(operations);
       database.exec("BEGIN");
       try {
         const results = operations.map((operation) => operation.batch());
@@ -62,6 +64,9 @@ function d1Adapter(database) {
     interceptRun(callback) {
       beforeRun = callback;
     },
+    interceptBatch(callback) {
+      beforeBatch = callback;
+    },
   };
 }
 
@@ -73,6 +78,7 @@ function openDatabase() {
     "0002_semantic_graph.sql",
     "0003_vector_resilience.sql",
     "0004_content_topics.sql",
+    "0005_memory_consolidations.sql",
   ]) {
     database.exec(readFileSync(resolve(import.meta.dirname, "..", "migrations", name), "utf8"));
   }
@@ -1708,6 +1714,400 @@ test("recallable false preserves storage, explicit topics, and manual search wit
     assert.equal(typeof manualSearch.results[0].lexicalSimilarity, "number");
     assert.equal(manualSearch.results[0].semanticSimilarity, null);
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM facts").get().count, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("consolidation is leased, supersedes the prior checkpoint, and invalidates on source mutation", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const disabledEnv = baseEnvironment(DB);
+    const idleContext = { waitUntil() {} };
+    const sourceIds = [];
+    for (let index = 0; index < 20; index += 1) {
+      const saved = await worker.fetch(request("/v3/documents", {
+        containerTag: "memories",
+        customId: `consolidation-source-${index}`,
+        content: `Verified source ${index}`,
+        metadata: { sm_project_id: "consolidation-project" },
+      }), disabledEnv, idleContext).then((response) => response.json());
+      sourceIds.push(saved.id);
+    }
+
+    const payload = {
+      title: "Project checkpoint",
+      overview: "A safe restart checkpoint.",
+      verified: ["Twenty source records were stored."],
+      unverified: ["A future choice is not verified."],
+      unresolved: ["Choose the next milestone."],
+      nextActions: ["Review the open milestone."],
+    };
+    const waits = [];
+    const context = { waitUntil: (promise) => waits.push(promise) };
+    const ai = {
+      run: async (_model, input) => {
+        if (input.text) return { data: [embedding()] };
+        if (input.response_format?.json_schema?.name === "memory_consolidation") {
+          return { choices: [{ message: { content: JSON.stringify(payload) } }] };
+        }
+        return enrichment([{ subject: "duplicate", predicate: "must", object: "not publish", confidence: 1, exclusive: true }], ["Checkpoint"]);
+      },
+    };
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: ai,
+      MEMORY_VECTORS: { upsert: async () => ({ mutationId: "checkpoint-vector" }) },
+    });
+    const first = await worker.fetch(request("/v4/consolidate", {
+      projectId: "consolidation-project",
+      force: true,
+    }), env, context);
+    assert.equal(first.status, 200);
+    const firstBody = await first.json();
+    assert.equal(firstBody.status, "consolidated");
+    assert.equal(firstBody.revision, 1);
+    assert.equal(firstBody.sourceCount, 20);
+    assert.deepEqual(new Set(firstBody.sourceMemoryIds), new Set(sourceIds));
+    await Promise.all(waits.splice(0));
+    const firstSummary = database.prepare(
+      "SELECT is_forgotten, fact_status, metadata_json FROM memories WHERE id = ?",
+    ).get(firstBody.memoryId);
+    assert.equal(firstSummary.is_forgotten, 0);
+    assert.equal(firstSummary.fact_status, "disabled");
+    assert.equal(JSON.parse(firstSummary.metadata_json).sm_consolidation, true);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM facts WHERE source_memory_id = ?").get(firstBody.memoryId).count, 0);
+
+    const additional = await worker.fetch(request("/v3/documents", {
+      containerTag: "memories",
+      customId: "consolidation-source-20",
+      content: "Verified source 20",
+      metadata: { sm_project_id: "consolidation-project" },
+    }), disabledEnv, idleContext).then((response) => response.json());
+    sourceIds.push(additional.id);
+
+    const failed = await worker.fetch(request("/v4/consolidate", {
+      projectId: "consolidation-project",
+      force: true,
+    }), { ...env, AI: { run: async () => { throw new Error("AI unavailable"); } } }, context);
+    assert.equal(failed.status, 500);
+    assert.equal(database.prepare("SELECT status FROM memory_consolidations WHERE id = ?").get(firstBody.consolidationId).status, "active");
+    assert.equal(database.prepare("SELECT is_forgotten FROM memories WHERE id = ?").get(firstBody.memoryId).is_forgotten, 0);
+
+    const entered = deferred();
+    const release = deferred();
+    const racingEnv = { ...env, AI: {
+      run: async (model, input) => {
+        if (input.response_format?.json_schema?.name === "memory_consolidation") {
+          entered.resolve();
+          await release.promise;
+        }
+        return ai.run(model, input);
+      },
+    } };
+    const secondPromise = worker.fetch(request("/v4/consolidate", {
+      projectId: "consolidation-project",
+      force: true,
+    }), racingEnv, context);
+    await entered.promise;
+    const competing = await worker.fetch(request("/v4/consolidate", {
+      projectId: "consolidation-project",
+      force: true,
+    }), racingEnv, context).then((response) => response.json());
+    assert.equal(competing.status, "busy");
+    release.resolve();
+    const secondBody = await secondPromise.then((response) => response.json());
+    assert.equal(secondBody.revision, 2);
+    assert.equal(secondBody.sourceCount, 21);
+    await Promise.all(waits.splice(0));
+    assert.equal(database.prepare("SELECT is_forgotten FROM memories WHERE id = ?").get(firstBody.memoryId).is_forgotten, 1);
+
+    const patched = await worker.fetch(request(`/v3/documents/${sourceIds[0]}`, {
+      content: "Mutated source invalidates its checkpoint.",
+    }, "PATCH"), disabledEnv, idleContext);
+    assert.equal(patched.status, 200);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM memory_consolidations WHERE status = 'active'").get().count, 0);
+    assert.equal(database.prepare("SELECT is_forgotten FROM memories WHERE id = ?").get(secondBody.memoryId).is_forgotten, 1);
+
+    const thirdBody = await worker.fetch(request("/v4/consolidate", {
+      projectId: "consolidation-project",
+      force: true,
+    }), env, context).then((response) => response.json());
+    await Promise.all(waits.splice(0));
+    const forgottenSummary = await worker.fetch(request("/v4/memories", {
+      containerTag: "memories",
+      documentId: thirdBody.memoryId,
+    }, "DELETE"), disabledEnv, idleContext);
+    assert.equal(forgottenSummary.status, 200);
+    assert.equal(database.prepare("SELECT status FROM memory_consolidations WHERE id = ?").get(thirdBody.consolidationId).status, "invalid");
+    assert.equal(database.prepare("SELECT active_consolidation_id FROM memory_consolidation_projects WHERE project_key = ?").get("project:consolidation-project").active_consolidation_id, null);
+    const afterSelfForget = await worker.fetch(request("/v4/consolidate", {
+      projectId: "consolidation-project",
+      force: true,
+    }), env, context).then((response) => response.json());
+    assert.equal(afterSelfForget.status, "consolidated");
+    await Promise.all(waits.splice(0));
+  } finally {
+    database.close();
+  }
+});
+
+test("hard delete atomically invalidates a consolidation published after its pre-read", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const env = baseEnvironment(DB);
+    const context = { waitUntil() {} };
+    const source = await worker.fetch(request("/v3/documents", {
+      containerTag: "memories",
+      customId: "hard-delete-source",
+      content: "Source deleted during publication.",
+      metadata: { sm_project_id: "hard-delete-project" },
+    }), env, context).then((response) => response.json());
+    const sourceRevision = database.prepare("SELECT topic_revision FROM memories WHERE id = ?").get(source.id).topic_revision;
+    let injected = false;
+    DB.interceptBatch(async (operations) => {
+      if (injected || !operations.some((operation) => operation.sql.trim() === "DELETE FROM memories WHERE id = ?")) return;
+      injected = true;
+      const now = "2026-09-12T00:00:00.000Z";
+      database.prepare(
+        `INSERT INTO memories(id, custom_id, container_tag, content, metadata_json, status, is_forgotten,
+           embedding_status, fact_status, vector_status, topic_status, topic_revision, created_at, updated_at)
+         VALUES (?, ?, 'memories', 'Racing summary', ?, 'done', 0, 'disabled', 'disabled', 'disabled',
+           'disabled', ?, ?, ?)`,
+      ).run("racing-summary", "racing-summary", JSON.stringify({ sm_consolidation: true }), "racing-revision", now, now);
+      database.prepare(
+        `INSERT INTO memory_consolidation_projects(project_key, project_id, source_container_tag, revision,
+           active_consolidation_id, last_success_at, created_at, updated_at)
+         VALUES ('project:hard-delete-project', 'hard-delete-project', 'memories', 1, 'racing-consolidation', ?, ?, ?)`,
+      ).run(now, now, now);
+      database.prepare(
+        `INSERT INTO memory_consolidations(id, project_key, memory_id, revision, status, created_at, updated_at)
+         VALUES ('racing-consolidation', 'project:hard-delete-project', 'racing-summary', 1, 'active', ?, ?)`,
+      ).run(now, now);
+      database.prepare(
+        `INSERT INTO memory_consolidation_sources(consolidation_id, memory_id, source_revision)
+         VALUES ('racing-consolidation', ?, ?)`,
+      ).run(source.id, sourceRevision);
+    });
+
+    const deleted = await worker.fetch(new Request(`https://memory.example/v3/documents/${source.id}`, {
+      method: "DELETE",
+      headers: { Authorization: "Bearer test-key" },
+    }), env, context);
+    assert.equal(deleted.status, 204);
+    assert.equal(injected, true);
+    assert.equal(database.prepare("SELECT status FROM memory_consolidations WHERE id = 'racing-consolidation'").get().status, "invalid");
+    assert.equal(database.prepare("SELECT is_forgotten FROM memories WHERE id = 'racing-summary'").get().is_forgotten, 1);
+    assert.equal(database.prepare("SELECT active_consolidation_id FROM memory_consolidation_projects WHERE project_key = 'project:hard-delete-project'").get().active_consolidation_id, null);
+  } finally {
+    database.close();
+  }
+});
+
+test("large source history stays bounded on disk and active checkpoint wins index-only recall", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const now = "2026-09-12T00:00:00.000Z";
+    database.prepare(
+      "INSERT INTO container_tags(tag, name, created_at, updated_at) VALUES ('memories', 'Memories', ?, ?)",
+    ).run(now, now);
+    database.prepare(
+      `INSERT INTO memories(id, custom_id, container_tag, content, metadata_json, status, is_forgotten,
+         embedding_status, fact_status, vector_status, topic_status, topic_revision, created_at, updated_at)
+       VALUES ('large-summary-1', 'large-summary-1', 'memories', 'Previous needle checkpoint', ?, 'done', 0,
+         'disabled', 'disabled', 'disabled', 'disabled', 'large-summary-revision', ?, ?)`,
+    ).run(JSON.stringify({ sm_consolidation: true, sm_project_id: "large-project" }), now, now);
+    database.prepare(
+      `INSERT INTO memory_consolidation_projects(project_key, project_id, source_container_tag, revision,
+         active_consolidation_id, last_success_at, created_at, updated_at)
+       VALUES ('project:large-project', 'large-project', 'memories', 1, 'large-consolidation-1', ?, ?, ?)`,
+    ).run(now, now, now);
+    database.prepare(
+      `INSERT INTO memory_consolidations(id, project_key, memory_id, revision, status, created_at, updated_at)
+       VALUES ('large-consolidation-1', 'project:large-project', 'large-summary-1', 1, 'active', ?, ?)`,
+    ).run(now, now);
+    const insertMemory = database.prepare(
+      `INSERT INTO memories(id, custom_id, container_tag, content, metadata_json, status, is_forgotten,
+         embedding_status, fact_status, vector_status, topic_status, topic_revision, created_at, updated_at)
+       VALUES (?, ?, 'memories', ?, ?, 'done', 0, 'disabled', 'disabled', 'disabled', 'disabled', ?, ?, ?)`,
+    );
+    const insertSource = database.prepare(
+      "INSERT INTO memory_consolidation_sources(consolidation_id, memory_id, source_revision) VALUES ('large-consolidation-1', ?, ?)",
+    );
+    database.exec("BEGIN");
+    for (let index = 0; index < 1_720; index += 1) {
+      const id = `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+      const revision = `revision-${index}`;
+      insertMemory.run(id, `large-${index}`, `Archived source ${index}`, JSON.stringify({ sm_project_id: "large-project" }), revision, now, now);
+      insertSource.run(id, revision);
+    }
+    database.exec("COMMIT");
+    const envOff = baseEnvironment(DB);
+    await worker.fetch(request("/v3/documents", {
+      containerTag: "memories",
+      customId: "large-new-source",
+      content: "New source for the bounded checkpoint.",
+      metadata: { sm_project_id: "large-project" },
+    }), envOff, { waitUntil() {} });
+    const waits = [];
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: { run: async (_model, input) => {
+        if (input.text) return { data: [embedding()] };
+        if (input.response_format?.json_schema?.name === "memory_consolidation") {
+          return { choices: [{ message: { content: JSON.stringify({
+            title: "Needle checkpoint",
+            overview: "Bounded metadata checkpoint.",
+            verified: [], unverified: [], unresolved: [], nextActions: [],
+          }) } }] };
+        }
+        return enrichment([], ["Checkpoint"]);
+      } },
+      MEMORY_VECTORS: { upsert: async () => ({ mutationId: "large-checkpoint" }) },
+    });
+    const consolidated = await worker.fetch(request("/v4/consolidate", {
+      projectId: "large-project",
+      force: true,
+    }), env, { waitUntil: (promise) => waits.push(promise) }).then((response) => response.json());
+    await Promise.all(waits);
+    assert.equal(consolidated.sourceCount, 1_721);
+    assert.equal(consolidated.sourceMemoryIds.length, 1_000);
+    assert.equal(consolidated.sourceMemoryIdsTruncated, true);
+    const storedMetadata = database.prepare("SELECT metadata_json FROM memories WHERE id = ?").get(consolidated.memoryId).metadata_json;
+    assert.ok(Buffer.byteLength(storedMetadata, "utf8") < 64 * 1024);
+    assert.equal(JSON.parse(storedMetadata).sourceMemoryIds.length, 1_000);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM memory_consolidation_sources WHERE consolidation_id = ?").get(consolidated.consolidationId).count, 1_721);
+
+    const insertCheckpoint = database.prepare(
+      `INSERT INTO memories(id, custom_id, container_tag, content, metadata_json, status, is_forgotten,
+         embedding_status, fact_status, vector_status, topic_status, topic_revision, created_at, updated_at)
+       VALUES (?, ?, 'memories', 'Unrelated checkpoint', ?, 'done', 0, 'disabled', 'disabled',
+         'disabled', 'disabled', ?, ?, ?)`,
+    );
+    const insertProject = database.prepare(
+      `INSERT INTO memory_consolidation_projects(project_key, project_id, source_container_tag, revision,
+         active_consolidation_id, last_success_at, created_at, updated_at)
+       VALUES (?, ?, 'memories', 1, ?, ?, ?, ?)`,
+    );
+    const insertConsolidation = database.prepare(
+      `INSERT INTO memory_consolidations(id, project_key, memory_id, revision, status, created_at, updated_at)
+       VALUES (?, ?, ?, 1, 'active', ?, ?)`,
+    );
+    database.exec("BEGIN");
+    for (let index = 0; index < 101; index += 1) {
+      const memoryId = `unrelated-summary-${index}`;
+      const projectId = `unrelated-project-${index}`;
+      const projectKey = `project:${projectId}`;
+      const consolidationId = `unrelated-consolidation-${index}`;
+      const metadata = JSON.stringify({
+        sm_consolidation: true,
+        sm_project_id: projectId,
+        memoryIndex: { version: 1, title: "Unrelated checkpoint", description: "Other subject", sections: [], recallable: true },
+      });
+      insertCheckpoint.run(memoryId, memoryId, metadata, `unrelated-revision-${index}`, now, now);
+      insertProject.run(projectKey, projectId, consolidationId, now, now, now);
+      insertConsolidation.run(consolidationId, projectKey, memoryId, now, now);
+    }
+    database.exec("COMMIT");
+
+    for (let index = 0; index < 60; index += 1) {
+      await worker.fetch(request("/v3/documents", {
+        containerTag: "memories",
+        customId: `needle-crowd-${index}`,
+        content: `needle crowd ${index}`,
+        metadata: { sm_project_id: `crowd-${index}` },
+      }), envOff, { waitUntil() {} });
+    }
+    const recalled = await worker.fetch(request("/v4/search", {
+      containerTag: "memories",
+      q: "needle",
+      indexOnly: true,
+      limit: 20,
+    }), envOff, { waitUntil() {} }).then((response) => response.json());
+    assert.equal(recalled.results[0].id, consolidated.memoryId);
+    assert.equal(recalled.results[0].metadata.sourceMemoryIds.length, 1_721);
+  } finally {
+    database.close();
+  }
+});
+
+test("daily consolidation runs at twenty memories or three days and skips nineteen fresh memories", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const disabledEnv = baseEnvironment(DB);
+    const idleContext = { waitUntil() {} };
+    const seed = async (projectId, count) => {
+      const ids = [];
+      for (let index = 0; index < count; index += 1) {
+        const body = await worker.fetch(request("/v3/documents", {
+          containerTag: "memories",
+          customId: `${projectId}-${index}`,
+          content: `${projectId} memory ${index}`,
+          metadata: { sm_project_id: projectId },
+        }), disabledEnv, idleContext).then((response) => response.json());
+        ids.push(body.id);
+      }
+      return ids;
+    };
+    await seed("fresh-nineteen", 19);
+    await seed("fresh-twenty", 20);
+    const bulkIds = await seed("initial-bulk", 81);
+    database.prepare(
+      `UPDATE memories SET created_at = '2026-09-01T00:00:00.000Z'
+       WHERE json_extract(metadata_json, '$.sm_project_id') = 'initial-bulk'`,
+    ).run();
+    const [agedId] = await seed("aged-one", 1);
+    database.prepare("UPDATE memories SET created_at = ? WHERE id = ?").run("2026-09-01T00:00:00.000Z", agedId);
+
+    let consolidationCalls = 0;
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: {
+        run: async (_model, input) => {
+          if (input.text) return { data: [embedding()] };
+          if (input.response_format?.json_schema?.name === "memory_consolidation") {
+            consolidationCalls += 1;
+            return { choices: [{ message: { content: JSON.stringify({
+              title: "Scheduled checkpoint",
+              overview: "Scheduled consolidation.",
+              verified: [],
+              unverified: [],
+              unresolved: [],
+              nextActions: [],
+            }) } }] };
+          }
+          return enrichment([], ["Checkpoint"]);
+        },
+      },
+      MEMORY_VECTORS: { upsert: async () => ({ mutationId: "scheduled-checkpoint" }) },
+    });
+    const waits = [];
+    const context = { waitUntil: (promise) => waits.push(promise) };
+    worker.scheduled({ cron: "0 18 * * *" }, env, context);
+    await waits[0];
+    await Promise.all(waits.slice(1));
+
+    assert.equal(consolidationCalls, 5);
+    const activeProjects = new Set(database.prepare(
+      "SELECT project_key FROM memory_consolidations WHERE status = 'active'",
+    ).all().map((row) => row.project_key));
+    assert.equal(activeProjects.has("project:fresh-nineteen"), false);
+    assert.equal(activeProjects.has("project:fresh-twenty"), true);
+    assert.equal(activeProjects.has("project:aged-one"), true);
+    assert.equal(activeProjects.has("project:initial-bulk"), true);
+    assert.equal(database.prepare(
+      "SELECT initial_backfill_completed FROM memory_consolidation_projects WHERE project_key = 'project:initial-bulk'",
+    ).get().initial_backfill_completed, 1);
+    const bulkActive = database.prepare(
+      "SELECT id FROM memory_consolidations WHERE project_key = 'project:initial-bulk' AND status = 'active'",
+    ).get();
+    assert.equal(database.prepare(
+      "SELECT COUNT(*) AS count FROM memory_consolidation_sources WHERE consolidation_id = ?",
+    ).get(bulkActive.id).count, bulkIds.length);
   } finally {
     database.close();
   }

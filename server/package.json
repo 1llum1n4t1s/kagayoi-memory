@@ -1,5 +1,5 @@
 {
-  "name": "@cloudflare-supermemory/server",
+  "name": "@kagayoi/memory-server",
   "version": "1.0.2",
   "private": true,
   "type": "module",
@@ -7,8 +7,8 @@
     "build": "tsc --noEmit",
     "check": "pnpm build && pnpm test",
     "deploy": "wrangler deploy --minify",
-    "migrate:local": "wrangler d1 migrations apply cloudflare-supermemory --local",
-    "migrate:remote": "wrangler d1 migrations apply cloudflare-supermemory --remote",
+    "migrate:local": "wrangler d1 migrations apply DB --local",
+    "migrate:remote": "wrangler d1 migrations apply DB --remote",
     "test": "node --experimental-transform-types --test tests/auth.test.mjs tests/topics.test.mjs tests/races.test.mjs && node tests/smoke.mjs",
     "test:live": "node tests/live-smoke.mjs"
   },

@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 export const REPOSITORY_ROOT = path.dirname(path.dirname(SCRIPT_PATH));
-export const DEFAULT_OUTPUT = path.join(REPOSITORY_ROOT, "dist", "cloudflare-supermemory");
+export const DEFAULT_OUTPUT = path.join(REPOSITORY_ROOT, "dist", "kagayoi-memory");
 
 const REQUIRED_FILES = new Set([
   ".codex-plugin/plugin.json",

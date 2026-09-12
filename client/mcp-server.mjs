@@ -4,7 +4,7 @@ import { isAbsolute } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { api, getReadContext, searchIndex, listIndex, listTopics, readDocument, formatSearchResult, discoverSearchContainers } from "./memory-client.mjs";
-import { DEFAULT_MEMORY_CONTAINER } from "./Import-CodexSupermemoryHistory.mjs";
+import { DEFAULT_MEMORY_CONTAINER } from "./Import-KagayoiMemoryHistory.mjs";
 import { buildMemoryIndex } from "./memory-index.mjs";
 
 const SERVER_VERSION = JSON.parse(readFileSync(new URL("../.codex-plugin/plugin.json", import.meta.url), "utf8")).version;
@@ -25,7 +25,7 @@ const sourceFolderProperty = {
 const tools = [
   {
     name: "search_memory",
-    description: "Search concise memory indexes by topic across every nonempty Supermemory space, independent of the current work folder. Returns document IDs, source spaces and dates; use getDocument for details. An explicit containerTag restricts the search to that space.",
+    description: "Search concise memory indexes by topic across every nonempty Kagayoi Memory space, independent of the current work folder. Returns document IDs, source spaces and dates; use getDocument for details. An explicit containerTag restricts the search to that space.",
     inputSchema: {
       type: "object",
       properties: {
@@ -57,6 +57,19 @@ const tools = [
       additionalProperties: false,
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: "consolidate_memory",
+    description: "Create or refresh the consolidated checkpoint for one project immediately. Originals are retained; sourceFolder identifies the current project when projectId is omitted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 160, description: "Project provenance ID. Omit to derive it from sourceFolder or the MCP workspace root." },
+        sourceFolder: sourceFolderProperty,
+      },
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
     name: "listMemories",
@@ -102,7 +115,7 @@ const tools = [
   },
   {
     name: "whoAmI",
-    description: "Show the active self-hosted Cloudflare memory context. sourceFolder can identify the current workspace when client roots are unavailable.",
+    description: "Show the active self-hosted Kagayoi Memory context. sourceFolder can identify the current workspace when client roots are unavailable.",
     inputSchema: { type: "object", properties: { sourceFolder: sourceFolderProperty }, additionalProperties: false },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -183,6 +196,28 @@ export async function callTool(name, args, { request = api, context, settings, r
     return textResult(message, { action: "save", success: true, containerTag, message, id: result.id, status: result.status });
   }
 
+  if (name === "consolidate_memory") {
+    if (args.projectId !== undefined && (typeof args.projectId !== "string" || !args.projectId.trim() || args.projectId.length > 160)) {
+      throw new Error("projectId must be a nonempty string of at most 160 characters.");
+    }
+    const workspace = args.projectId === undefined ? await workspaceContext() : null;
+    const projectId = typeof args.projectId === "string" ? args.projectId.trim() : workspace?.containerTag;
+    if (!projectId) throw new Error("projectId or exactly one workspace root/sourceFolder is required.");
+    const result = await request("/v4/consolidate", {
+      method: "POST",
+      body: { projectId, force: true },
+      timeoutMs: 120_000,
+    });
+    const messages = {
+      consolidated: `Memory consolidation completed for ${projectId}.`,
+      no_unconsolidated_memories: `No unconsolidated memories were found for ${projectId}.`,
+      not_due: `Memory consolidation is not due for ${projectId}.`,
+      busy: `Memory consolidation is already running for ${projectId}.`,
+    };
+    const message = result.message || messages[result.status] || `Memory consolidation request finished for ${projectId}.`;
+    return textResult(message, { ...result, projectId });
+  }
+
   if (name === "listMemories" || name === "listDocuments") {
     if (args.page !== undefined && (!Number.isInteger(args.page) || args.page < 1)) throw new Error("page must be a positive integer.");
     if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 50)) throw new Error("limit must be an integer from 1 through 50.");
@@ -258,7 +293,7 @@ let nextServerRequestId = 1;
 const pendingClientRequests = new Map();
 
 function requestClient(method, params, timeoutMs = 1_000) {
-  const id = `cloudflare-supermemory-${nextServerRequestId++}`;
+  const id = `kagayoi-memory-${nextServerRequestId++}`;
   return new Promise((resolveRequest, reject) => {
     const timeout = setTimeout(() => {
       pendingClientRequests.delete(id);
@@ -343,7 +378,7 @@ async function handle(message) {
       result = {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cloudflare-supermemory", version: SERVER_VERSION },
+        serverInfo: { name: "kagayoi-memory", version: SERVER_VERSION },
       };
     } else if (message.method === "ping") {
       result = {};
@@ -363,7 +398,7 @@ async function handle(message) {
       jsonrpc: "2.0",
       id: message.id,
       result: {
-        content: [{ type: "text", text: error instanceof Error ? error.message : "Cloudflare memory request failed" }],
+        content: [{ type: "text", text: error instanceof Error ? error.message : "Kagayoi Memory request failed" }],
         isError: true,
       },
     });

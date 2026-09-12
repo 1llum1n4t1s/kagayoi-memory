@@ -23,7 +23,15 @@ const MAX_DOCUMENT_CHARS = 180_000;
 const DEFAULT_LIST_LIMIT = 50;
 const RECENT_TRANSCRIPT_WINDOW_MS = 10 * 60 * 1000;
 const REDACTED = "[REDACTED]";
+const RENAMED_REPOSITORY_IDENTITIES = new Map([
+  ["github.com/1llum1n4t1s/kagayoi-memory", {
+    identity: "github.com/1llum1n4t1s/cloudflare-supermemory",
+    projectName: "cloudflare_supermemory",
+  }],
+]);
 export const DEFAULT_MEMORY_CONTAINER = "memories";
+export const CONFIG_FILE_NAME = "kagayoi-memory.json";
+export const LEGACY_CONFIG_FILE_NAME = "supermemory.json";
 
 function fail(message) {
   throw new Error(message);
@@ -71,9 +79,17 @@ function parseArguments(argv) {
   }
 
   options.codexHome = resolve(options.codexHome);
-  options.statePath = options.statePath
-    ? resolve(options.statePath)
-    : join(homedir(), ".codex-supermemory", `history-import-v${IMPORT_VERSION}.json`);
+  if (options.statePath) {
+    options.statePath = resolve(options.statePath);
+  } else {
+    const currentStatePath = join(homedir(), ".kagayoi-memory", `history-import-v${IMPORT_VERSION}.json`);
+    const legacyStatePath = join(homedir(), ".codex-supermemory", `history-import-v${IMPORT_VERSION}.json`);
+    if (options.apply && !existsSync(currentStatePath) && existsSync(legacyStatePath)) {
+      mkdirSync(dirname(currentStatePath), { recursive: true });
+      renameSync(legacyStatePath, currentStatePath);
+    }
+    options.statePath = existsSync(currentStatePath) || !existsSync(legacyStatePath) ? currentStatePath : legacyStatePath;
+  }
   return options;
 }
 
@@ -119,25 +135,31 @@ function getProjectContext(cwd = process.cwd()) {
   const remote = normalizeRemote(git(["remote", "get-url", "origin"], root));
   const repoName = basename(remote || root).replace(/\.git$/i, "") || basename(root) || "unknown";
   const projectName = repoName.toLowerCase().replace(/[^a-z0-9]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "").slice(0, 72) || "unknown";
-  const identity = remote || `path:${root}`;
+  // 製品リポジトリの改名では、既存文書・fact関係のprovenance IDだけを1.xと同一に保つ。
+  const legacy = RENAMED_REPOSITORY_IDENTITIES.get(remote);
+  const identity = legacy?.identity || remote || `path:${root}`;
+  const provenanceProjectName = legacy?.projectName || projectName;
   return {
     projectName,
-    containerTag: `repo_${projectName}__${sha256(identity).slice(0, 16)}`,
+    containerTag: `repo_${provenanceProjectName}__${sha256(identity).slice(0, 16)}`,
   };
 }
 
 function loadConfig(codexHome) {
-  const environmentBaseUrl = typeof process.env.SUPERMEMORY_API_URL === "string" ? process.env.SUPERMEMORY_API_URL.trim() : "";
-  const environmentApiKey = [process.env.SUPERMEMORY_CODEX_API_KEY, process.env.CLOUDFLARE_MEMORY_API_KEY]
+  const environmentBaseUrl = [process.env.KAGAYOI_MEMORY_API_URL, process.env.SUPERMEMORY_API_URL]
     .find((value) => typeof value === "string" && value.trim())?.trim() || "";
-  const configPath = join(codexHome, "supermemory.json");
+  const environmentApiKey = [process.env.KAGAYOI_MEMORY_API_KEY, process.env.SUPERMEMORY_CODEX_API_KEY, process.env.CLOUDFLARE_MEMORY_API_KEY]
+    .find((value) => typeof value === "string" && value.trim())?.trim() || "";
+  const currentConfigPath = join(codexHome, CONFIG_FILE_NAME);
+  const legacyConfigPath = join(codexHome, LEGACY_CONFIG_FILE_NAME);
+  const configPath = existsSync(currentConfigPath) ? currentConfigPath : legacyConfigPath;
   let config = {};
   if (existsSync(configPath)) {
     try {
       config = JSON.parse(readFileSync(configPath, "utf8"));
       if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("invalid configuration");
     } catch {
-      if (!environmentBaseUrl || !environmentApiKey) fail("supermemory.json must contain valid JSON.");
+      if (!environmentBaseUrl || !environmentApiKey) fail(`${configPath} must contain valid JSON.`);
       config = {};
     }
   }
@@ -146,7 +168,7 @@ function loadConfig(codexHome) {
   const baseUrl = environmentBaseUrl || (typeof config.baseUrl === "string" ? config.baseUrl.trim() : "");
   const apiKey = environmentApiKey || (typeof config.apiKey === "string" ? config.apiKey.trim() : "");
   if (!baseUrl || !apiKey) {
-    fail("Supermemory configuration requires baseUrl and apiKey (file values may be overridden by SUPERMEMORY_API_URL and SUPERMEMORY_CODEX_API_KEY). Values are never printed.");
+    fail("Kagayoi Memory configuration requires baseUrl and apiKey (file values may be overridden by KAGAYOI_MEMORY_API_URL and KAGAYOI_MEMORY_API_KEY). Values are never printed.");
   }
 
   const normalizedBaseUrl = normalizeEndpoint(baseUrl);
@@ -158,14 +180,14 @@ function normalizeEndpoint(baseUrl) {
   try {
     parsed = new URL(baseUrl);
   } catch {
-    fail("Cloudflare Supermemory endpoint is invalid.");
+    fail("Kagayoi Memory endpoint is invalid.");
   }
   const hostname = parsed.hostname.toLowerCase();
   const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
   const officialSupermemory = hostname === "supermemory.ai" || hostname.endsWith(".supermemory.ai");
   const acceptedProtocol = parsed.protocol === "https:" || (local && parsed.protocol === "http:");
   if (!acceptedProtocol || parsed.username || parsed.password || parsed.search || parsed.hash || officialSupermemory) {
-    fail("Refusing a non-Cloudflare Supermemory endpoint.");
+    fail("Refusing an unsupported Kagayoi Memory endpoint.");
   }
   return parsed.toString().replace(/\/+$/, "");
 }
@@ -182,7 +204,7 @@ async function api(config, path, { method = "GET", body } = {}) {
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
   });
-  if (!response.ok) fail(`Cloudflare memory API request failed (HTTP ${response.status}).`);
+  if (!response.ok) fail(`Kagayoi Memory API request failed (HTTP ${response.status}).`);
   return response.status === 204 ? null : response.json();
 }
 
@@ -243,7 +265,7 @@ function sanitizeText(value, knownSecrets, counter) {
   let text = value
     .replace(/<private>[\s\S]*?<\/private>/gi, REDACTED)
     .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
-    .replace(/<supermemory-context>[\s\S]*?<\/supermemory-context>/gi, "")
+    .replace(/<(?:kagayoi-memory|supermemory)-context>[\s\S]*?<\/(?:kagayoi-memory|supermemory)-context>/gi, "")
     .replace(/\r\n/g, "\n")
     .trim();
 
@@ -363,7 +385,7 @@ function cleanUserRequest(value) {
   if (typeof value !== "string") return "";
   let text = value.replace(/\r\n/g, "\n").trim();
   if (/^# AGENTS\.md instructions(?: for [^\n]*)?\s*\n/i.test(text)) return "";
-  for (const tag of ["recommended_plugins", "environment_context", "codex_internal_context", "supermemory-context", "supermemory-recall", "supermemory-index", "system-reminder"]) {
+  for (const tag of ["recommended_plugins", "environment_context", "codex_internal_context", "kagayoi-memory-context", "kagayoi-memory-recall", "kagayoi-memory-index", "supermemory-context", "supermemory-recall", "supermemory-index", "system-reminder"]) {
     text = text.replace(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`, "gi"), "");
   }
   const annotationBlocks = [];
@@ -439,7 +461,7 @@ function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars
         ...(project.projectName ? { project: project.projectName } : {}),
         ...(hasProjectProvenance ? { sm_project_id: project.containerTag } : {}),
         sm_scope: hasProjectProvenance ? "project" : "shared", sm_source: "codex",
-        sm_client: "codex-cloudflare", sessionId: candidate.meta.id,
+        sm_client: "codex-kagayoi-memory", sessionId: candidate.meta.id,
         rootSessionId: candidate.meta.rootSessionId, sessionKind: candidate.meta.isSubagent ? "subagent" : "root",
         turn: index + 1, part: partIndex + 1, parts: parts.length,
         captureVersion: 2, captureKey: `${identity}:${partIndex + 1}:${sha256(part).slice(0, 16)}`,

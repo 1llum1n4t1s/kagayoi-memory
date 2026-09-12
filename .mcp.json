@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "cloudflare_supermemory": {
+    "kagayoi_memory": {
       "command": "node",
       "args": [
         "./scripts/mcp-launcher.mjs"

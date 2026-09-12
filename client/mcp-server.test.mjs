@@ -44,18 +44,42 @@ test("MCP初期化は実装済みprotocolとplugin manifestのversionを返す",
   const response = await exchange({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2099-01-01" } });
   assert.equal(response.result.protocolVersion, "2025-06-18");
   assert.equal(response.result.serverInfo.version, manifest.version);
-  assert.equal(response.result.serverInfo.name, "cloudflare-supermemory");
+  assert.equal(response.result.serverInfo.name, "kagayoi-memory");
 });
 
 test("tools/listは作業場所が必要なツールだけにsourceFolderを公開する", async () => {
   const response = await exchange({ jsonrpc: "2.0", id: 1, method: "tools/list" });
   const schemas = new Map(response.result.tools.map((tool) => [tool.name, tool.inputSchema.properties]));
-  for (const name of ["add_memory", "whoAmI"]) {
+  for (const name of ["add_memory", "consolidate_memory", "whoAmI"]) {
     assert.ok(schemas.get(name).sourceFolder, `${name} must expose sourceFolder`);
   }
   for (const name of ["search_memory", "listMemories", "listDocuments", "listTopics", "getDocument", "listSpaces"]) {
     assert.equal(schemas.get(name).sourceFolder, undefined, `${name} must not expose sourceFolder`);
   }
+});
+
+test("consolidate_memoryは明示projectまたは作業場所を使って即時清書する", async (t) => {
+  const calls = [];
+  const request = async (path, options) => {
+    calls.push([path, options]);
+    return { status: "consolidated", consolidationId: "consolidation-1", memoryId: "summary-1", sourceCount: 21 };
+  };
+  const explicit = await callTool("consolidate_memory", { projectId: "repo-explicit" }, { request });
+  assert.deepEqual(calls[0], ["/v4/consolidate", {
+    method: "POST",
+    body: { projectId: "repo-explicit", force: true },
+    timeoutMs: 120_000,
+  }]);
+  assert.equal(explicit.structuredContent.projectId, "repo-explicit");
+
+  const sourceFolder = mkdtempSync(join(tmpdir(), "memory-consolidate-source-"));
+  t.after(() => rmSync(sourceFolder, { recursive: true, force: true }));
+  const derived = await callTool("consolidate_memory", { sourceFolder }, { request });
+  assert.match(calls[1][1].body.projectId, /^repo_memory_consolidate_source_.*__[a-f0-9]{16}$/);
+  assert.equal(derived.structuredContent.sourceCount, 21);
+
+  await assert.rejects(callTool("consolidate_memory", {}, { resolveContext: async () => null, request }), /projectId.*workspace/);
+  await assert.rejects(callTool("consolidate_memory", { projectId: " " }, { request }), /projectId/);
 });
 
 test("作業場所を解決できない手動保存も共通containerへ保存し出典を捏造しない", async () => {
@@ -174,9 +198,8 @@ test("roots対応クライアントでは単一のworkspace rootを遅延取得�
   const environment = {
     ...process.env,
     CODEX_HOME: codexHome,
-    SUPERMEMORY_API_URL: "",
-    SUPERMEMORY_CODEX_API_KEY: "",
-    CLOUDFLARE_MEMORY_API_KEY: "",
+    KAGAYOI_MEMORY_API_URL: "",
+    KAGAYOI_MEMORY_API_KEY: "",
   };
   await new Promise((resolveTest, reject) => {
     const child = spawn(process.execPath, [fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))], { env: environment, stdio: ["pipe", "pipe", "pipe"] });
@@ -241,9 +264,8 @@ test("並行呼び出しはroots取得を共有し、取得中の更新後は全
   const environment = {
     ...process.env,
     CODEX_HOME: codexHome,
-    SUPERMEMORY_API_URL: baseUrl,
-    SUPERMEMORY_CODEX_API_KEY: "concurrent-test-key",
-    CLOUDFLARE_MEMORY_API_KEY: "",
+    KAGAYOI_MEMORY_API_URL: baseUrl,
+    KAGAYOI_MEMORY_API_KEY: "concurrent-test-key",
   };
 
   await new Promise((resolveTest, reject) => {

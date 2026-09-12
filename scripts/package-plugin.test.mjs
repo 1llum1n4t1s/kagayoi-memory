@@ -69,12 +69,12 @@ test("validator requires installed-root MCP cwd and rejects machine-specific pat
     await buildPackage({ output });
     const manifestPath = path.join(output, ".mcp.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    delete manifest.mcpServers.cloudflare_supermemory.cwd;
+    delete manifest.mcpServers.kagayoi_memory.cwd;
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
     await assert.rejects(validatePlugin(output), /cwd must be \./u);
 
-    manifest.mcpServers.cloudflare_supermemory.cwd = ".";
-    manifest.mcpServers.cloudflare_supermemory.args.push("C:\\Users\\example\\plugin.mjs");
+    manifest.mcpServers.kagayoi_memory.cwd = ".";
+    manifest.mcpServers.kagayoi_memory.args.push("C:\\Users\\example\\plugin.mjs");
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
     await assert.rejects(validatePlugin(output), /machine-specific or non-portable path/u);
   } finally {

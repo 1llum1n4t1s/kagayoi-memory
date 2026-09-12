@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### 変更
+
+- 製品名を **Kagayoi Memory**、CodexプラグインIDと配布名を `kagayoi-memory`、セットアップSkill名を `setup-kagayoi-memory` に統一しました。
+- 通常の接続設定を `~/.codex/kagayoi-memory.json`、環境変数を `KAGAYOI_MEMORY_API_URL` / `KAGAYOI_MEMORY_API_KEY`、キャプチャ状態を `kagayoi-memory/capture-state/`、配布先を `dist/kagayoi-memory` へ移しました。
+- 1.xの旧プラグイン名、`supermemory.json`、旧環境変数、既存文書ID・保存先・`sm_*`メタデータは互換読み込みと移行の対象として維持します。Hosted Supermemoryとは引き続き独立したセルフホスト実装です。
+- 未整理記録が20件以上、または未整理記録があり前回の清書から3日経過したプロジェクトを、サーバー側の定期処理で清書するようにしました。`consolidate_memory` MCPツールでも即時実行できます。
+- プロジェクトの初回清書では、既存の古い記録を40件ずつの安全な入力へ分けながら、未整理がなくなるまで同じ定期実行内で自動バックフィルします。
+- 清書後も原文を保持し、最新の有効な清書を自動想起で優先します。原文の更新・忘却時は依存する清書を無効化します。
+
 ## 1.0.2 - 2026-09-12
 
 ### 変更

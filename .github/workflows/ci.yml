@@ -45,11 +45,11 @@ jobs:
         run: pnpm run package:plugin
 
       - name: Create plugin archive
-        run: tar -czf dist/cloudflare-supermemory.tar.gz -C dist cloudflare-supermemory
+        run: tar -czf dist/kagayoi-memory.tar.gz -C dist kagayoi-memory
 
       - name: Upload plugin archive
         uses: actions/upload-artifact@v7
         with:
-          name: cloudflare-supermemory
-          path: dist/cloudflare-supermemory.tar.gz
+          name: kagayoi-memory
+          path: dist/kagayoi-memory.tar.gz
           if-no-files-found: error

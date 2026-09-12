@@ -1,11 +1,11 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "cloudflare-supermemory",
+  "name": "kagayoi-memory",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-02",
   "workers_dev": true,
   "preview_urls": false,
-  "triggers": { "crons": ["*/15 * * * *"] },
+  "triggers": { "crons": ["*/15 * * * *", "0 18 * * *"] },
   "vars": { "AI_ENRICHMENT_MODE": "on" },
   "ai": { "binding": "AI" },
   "vectorize": [
@@ -14,7 +14,7 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "cloudflare-supermemory",
+      "database_name": "kagayoi-memory",
       "database_id": "replace-with-your-d1-database-id",
       "migrations_dir": "migrations"
     }

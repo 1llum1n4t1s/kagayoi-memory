@@ -1,5 +1,5 @@
 {
-  "name": "cloudflare-supermemory",
+  "name": "kagayoi-memory",
   "version": "1.0.2",
   "private": true,
   "type": "module",
@@ -13,7 +13,7 @@
     "test:scripts": "node --test scripts/*.test.mjs",
     "test:server": "pnpm -C server test",
     "validate:plugin": "node scripts/validate-plugin.mjs",
-    "package:plugin": "node scripts/package-plugin.mjs && node scripts/validate-plugin.mjs dist/cloudflare-supermemory",
+    "package:plugin": "node scripts/package-plugin.mjs && node scripts/validate-plugin.mjs dist/kagayoi-memory",
     "check": "pnpm run test && pnpm run validate:plugin && pnpm run package:plugin && pnpm -C server build"
   }
 }

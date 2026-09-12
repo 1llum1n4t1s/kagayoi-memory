@@ -1,17 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cleanUserRequest, parseTaskTranscript, buildTurnDocuments, readSessionMeta, getProjectContext } from "./Import-CodexSupermemoryHistory.mjs";
+import { cleanUserRequest, parseTaskTranscript, buildTurnDocuments, readSessionMeta, getProjectContext } from "./Import-KagayoiMemoryHistory.mjs";
 import { capture, findTranscript } from "./capture.mjs";
 
 const user = (text, timestamp) => ({ ...(timestamp ? { timestamp } : {}), type: "response_item", payload: { role: "user", content: [{ type: "input_text", text }] } });
 const assistant = (text, channel = "final", timestamp) => ({ ...(timestamp ? { timestamp } : {}), type: "response_item", payload: { role: "assistant", channel, content: [{ type: "output_text", text }] } });
+
+test("製品リポジトリ改名後も1.xのprovenance IDを維持する", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "kagayoi-memory-project-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  execFileSync("git", ["init", "--quiet", root]);
+  execFileSync("git", ["-C", root, "remote", "add", "origin", "git@github.com:1llum1n4t1s/kagayoi-memory.git"]);
+  const project = getProjectContext(root);
+  assert.equal(project.projectName, "kagayoi_memory");
+  assert.equal(project.containerTag, "repo_cloudflare_supermemory__57a9aa7a5083510a");
+});
+
 function fixture(t, rows = []) {
   const home = mkdtempSync(join(tmpdir(), "memory-capture-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -37,7 +48,7 @@ async function listen(t, handler) {
 
 function runHistoryImport(args) {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(process.execPath, [fileURLToPath(new URL("./Import-CodexSupermemoryHistory.mjs", import.meta.url)), ...args], {
+    const child = spawn(process.execPath, [fileURLToPath(new URL("./Import-KagayoiMemoryHistory.mjs", import.meta.url)), ...args], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -186,7 +197,7 @@ test("履歴importは全space一覧から旧containerの同じcaptureKeyを検�
       }));
     });
   });
-  writeFileSync(join(f.home, "supermemory.json"), JSON.stringify({ baseUrl, apiKey: "history-test-key" }));
+  writeFileSync(join(f.home, "kagayoi-memory.json"), JSON.stringify({ baseUrl, apiKey: "history-test-key" }));
   const result = await runHistoryImport(["--codex-home", f.home, "--include-recent", "--session-id", "task-a"]);
   assert.equal(result.code, 0, result.stderr);
   assert.deepEqual(listBodies, [{ page: 1, limit: 50, projection: "capture" }]);
@@ -270,7 +281,7 @@ test("同じタスクの保存が並行してもv2レシートを失わず次回
   const results = await Promise.all([first, second]);
   assert.deepEqual(results.map((result) => result.saved), [2, 2]);
   assert.ok(sent.every((document) => document.customId.startsWith("codex-turn-v2:")));
-  const stateDirectory = join(f.home, "cloudflare-memory", "capture-state");
+  const stateDirectory = join(f.home, "kagayoi-memory", "capture-state");
   const receiptFiles = readdirSync(stateDirectory).filter((name) => name.endsWith(".json"));
   assert.equal(receiptFiles.length, 1);
   const receipts = JSON.parse(readFileSync(join(stateDirectory, receiptFiles[0]), "utf8"));
@@ -281,10 +292,34 @@ test("同じタスクの保存が並行してもv2レシートを失わず次回
   assert.equal(retried, 0);
 });
 
+test("1.xの保存レシートを新しいturnと統合し、名称変更後も旧文書を再送しない", async (t) => {
+  const f = fixture(t, [user("依頼"), assistant("結果")]);
+  await capture(f.payload, { ...f.options, send: async (document) => ({ id: document.customId }) });
+  const currentDirectory = join(f.home, "kagayoi-memory", "capture-state");
+  const legacyDirectory = join(f.home, "cloudflare-memory", "capture-state");
+  const receiptName = readdirSync(currentDirectory).find((name) => name.endsWith(".json"));
+  mkdirSync(legacyDirectory, { recursive: true });
+  writeFileSync(join(legacyDirectory, receiptName), readFileSync(join(currentDirectory, receiptName)));
+  rmSync(join(f.home, "kagayoi-memory"), { recursive: true, force: true });
+  appendFileSync(f.path, [user("次の依頼"), assistant("次の結果")].map(JSON.stringify).join("\n") + "\n");
+
+  const sent = [];
+  const result = await capture(f.payload, { ...f.options, send: async (document) => { sent.push(document); return { id: document.customId }; } });
+  assert.deepEqual(result, { saved: 1, pending: 0, completedTurns: 2 });
+  assert.equal(sent.length, 1);
+  const migratedReceipts = JSON.parse(readFileSync(join(currentDirectory, receiptName), "utf8"));
+  assert.equal(migratedReceipts.length, 2);
+
+  let retried = 0;
+  const retry = await capture(f.payload, { ...f.options, send: async () => { retried += 1; return { id: "unexpected" }; } });
+  assert.deepEqual(retry, { saved: 0, pending: 0, completedTurns: 2 });
+  assert.equal(retried, 0);
+});
+
 test("レシート更新失敗でもSQLite transactionを解放して次回再試行できる", async (t) => {
   const f = fixture(t, [user("依頼"), assistant("結果")]);
   const project = getProjectContext(f.home);
-  const stateDirectory = join(f.home, "cloudflare-memory", "capture-state");
+  const stateDirectory = join(f.home, "kagayoi-memory", "capture-state");
   const stateId = createHash("sha256").update(`${f.options.config.baseUrl}:${project.containerTag}:${f.meta.id}`).digest("hex");
   const statePath = join(stateDirectory, `${stateId}.json`);
   await assert.rejects(capture(f.payload, { ...f.options, send: async (document) => {

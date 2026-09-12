@@ -15,7 +15,7 @@ if (event === "SessionStart" || event === "UserPromptSubmit") {
   if (Object.keys(result).length) process.stdout.write(JSON.stringify(result));
 } else if (event === "PreToolUse") {
   const readOnly = new Set(["search_memory", "listTopics", "listSpaces", "listMemories", "listDocuments", "getDocument", "whoAmI"]);
-  const name = /^mcp__cloudflare_supermemory__(.+)$/.exec(payload.tool_name || "")?.[1];
+  const name = /^mcp__kagayoi_memory__(.+)$/.exec(payload.tool_name || "")?.[1];
   if (readOnly.has(name)) process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
@@ -28,10 +28,10 @@ if (event === "SessionStart" || event === "UserPromptSubmit") {
   try {
     const result = await capture(payload);
     if (result.saved || result.pending) process.stdout.write(JSON.stringify({
-      systemMessage: `Cloudflare memory: saved ${result.saved} documents; pending ${result.pending}.`,
+      systemMessage: `Kagayoi Memory: saved ${result.saved} documents; pending ${result.pending}.`,
     }));
   } catch {
-    process.stderr.write("Cloudflare memory capture failed; unacknowledged records will be retried.\n");
+    process.stderr.write("Kagayoi Memory capture failed; unacknowledged records will be retried.\n");
     process.exitCode = 1;
   }
 }
