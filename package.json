@@ -1,6 +1,6 @@
 {
   "name": "kagayoi-memory",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.4.0",
