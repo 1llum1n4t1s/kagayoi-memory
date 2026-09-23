@@ -233,6 +233,516 @@ test("forget accepts a document ID only within its named container", async () =>
   }
 });
 
+test("forget cleanup restores a vector recreated before the pending delete completes", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const deleteStarted = deferred();
+    const releaseDelete = deferred();
+    const upserts = [];
+    let storedVector;
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: {
+        run: async (model) => model.includes("bge-m3")
+          ? { data: [embedding(0, 1)] }
+          : enrichment([], ["Restore race"]),
+      },
+      MEMORY_VECTORS: {
+        deleteByIds: async () => {
+          deleteStarted.resolve();
+          await releaseDelete.promise;
+          storedVector = undefined;
+          return { mutationId: "forgotten-delete" };
+        },
+        upsert: async (vectors) => {
+          upserts.push(vectors);
+          [storedVector] = vectors;
+          return { mutationId: `restore-${upserts.length}` };
+        },
+      },
+    });
+
+    env.AI_ENRICHMENT_MODE = "off";
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "forget-vector-race",
+      customId: "canonical",
+      content: "Original memory.",
+    }), env, { waitUntil() {} });
+    const { id } = await saved.json();
+    const originalRevision = database.prepare(
+      "SELECT topic_revision FROM memories WHERE id = ?",
+    ).get(id).topic_revision;
+    storedVector = { id, values: embedding(1, 0), metadata: { topic_revision: originalRevision } };
+
+    env.AI_ENRICHMENT_MODE = "on";
+    const forgetWaits = [];
+    const forgotten = await worker.fetch(request("/v4/memories", {
+      containerTag: "forget-vector-race",
+      documentId: id,
+    }, "DELETE"), env, { waitUntil: (promise) => forgetWaits.push(promise) });
+    assert.equal(forgotten.status, 200);
+    await deleteStarted.promise;
+
+    const restoreWaits = [];
+    const restored = await worker.fetch(request("/v3/documents", {
+      containerTag: "forget-vector-race",
+      customId: "canonical",
+      content: "Restored memory.",
+    }), env, { waitUntil: (promise) => restoreWaits.push(promise) });
+    assert.equal(restored.status, 201);
+    assert.equal((await restored.json()).id, id);
+    await Promise.all(restoreWaits);
+    const restoredRevision = database.prepare(
+      "SELECT topic_revision FROM memories WHERE id = ?",
+    ).get(id).topic_revision;
+    assert.equal(storedVector.metadata.topic_revision, restoredRevision);
+
+    releaseDelete.resolve();
+    await Promise.all(forgetWaits);
+
+    assert.notEqual(restoredRevision, originalRevision);
+    assert.equal(upserts.length, 2);
+    assert.equal(storedVector.metadata.topic_revision, restoredRevision);
+    assert.deepEqual(storedVector.values, embedding(0, 1));
+    assert.deepEqual(
+      { ...database.prepare(
+        "SELECT is_forgotten, vector_status, vector_mutation_id FROM memories WHERE id = ?",
+      ).get(id) },
+      { is_forgotten: 0, vector_status: "queued", vector_mutation_id: "restore-2" },
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("forget cleanup deletes a repair upsert superseded by another forget", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const firstDeleteStarted = deferred();
+    const releaseFirstDelete = deferred();
+    const repairStarted = deferred();
+    const releaseRepair = deferred();
+    let deletes = 0;
+    let upserts = 0;
+    let storedVector;
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: {
+        run: async (model) => model.includes("bge-m3")
+          ? { data: [embedding(0, 1)] }
+          : enrichment([], ["Restore race"]),
+      },
+      MEMORY_VECTORS: {
+        deleteByIds: async () => {
+          deletes += 1;
+          if (deletes === 1) {
+            firstDeleteStarted.resolve();
+            await releaseFirstDelete.promise;
+          }
+          storedVector = undefined;
+          return { mutationId: `delete-${deletes}` };
+        },
+        upsert: async (vectors) => {
+          upserts += 1;
+          if (upserts === 2) {
+            repairStarted.resolve();
+            await releaseRepair.promise;
+          }
+          [storedVector] = vectors;
+          return { mutationId: `upsert-${upserts}` };
+        },
+      },
+    });
+
+    env.AI_ENRICHMENT_MODE = "off";
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "forget-vector-twice",
+      customId: "canonical",
+      content: "Original memory.",
+    }), env, { waitUntil() {} });
+    const { id } = await saved.json();
+
+    env.AI_ENRICHMENT_MODE = "on";
+    const firstForgetWaits = [];
+    await worker.fetch(request("/v4/memories", {
+      containerTag: "forget-vector-twice",
+      documentId: id,
+    }, "DELETE"), env, { waitUntil: (promise) => firstForgetWaits.push(promise) });
+    await firstDeleteStarted.promise;
+
+    const restoreWaits = [];
+    await worker.fetch(request("/v3/documents", {
+      containerTag: "forget-vector-twice",
+      customId: "canonical",
+      content: "Restored memory.",
+    }), env, { waitUntil: (promise) => restoreWaits.push(promise) });
+    await Promise.all(restoreWaits);
+    releaseFirstDelete.resolve();
+    await repairStarted.promise;
+
+    const secondForgetWaits = [];
+    const forgottenAgain = await worker.fetch(request("/v4/memories", {
+      containerTag: "forget-vector-twice",
+      documentId: id,
+    }, "DELETE"), env, { waitUntil: (promise) => secondForgetWaits.push(promise) });
+    assert.equal(forgottenAgain.status, 200);
+    await Promise.all(secondForgetWaits);
+
+    releaseRepair.resolve();
+    await Promise.all(firstForgetWaits);
+
+    assert.equal(database.prepare("SELECT is_forgotten FROM memories WHERE id = ?").get(id).is_forgotten, 1);
+    assert.equal(upserts, 2);
+    assert.equal(deletes, 3);
+    assert.equal(storedVector, undefined);
+  } finally {
+    database.close();
+  }
+});
+
+test("forget cleanup leaves a failed repair immediately eligible for reconciliation", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const deleteStarted = deferred();
+    const releaseDelete = deferred();
+    let upserts = 0;
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: {
+        run: async (model) => model.includes("bge-m3")
+          ? { data: [embedding(0, 1)] }
+          : enrichment([], ["Restore race"]),
+      },
+      MEMORY_VECTORS: {
+        deleteByIds: async () => {
+          deleteStarted.resolve();
+          await releaseDelete.promise;
+          return { mutationId: "delete" };
+        },
+        upsert: async () => {
+          upserts += 1;
+          if (upserts === 2) throw new Error("Vectorize repair unavailable");
+          return { mutationId: "restore" };
+        },
+      },
+    });
+
+    env.AI_ENRICHMENT_MODE = "off";
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "forget-vector-retry",
+      customId: "canonical",
+      content: "Original memory.",
+    }), env, { waitUntil() {} });
+    const { id } = await saved.json();
+
+    env.AI_ENRICHMENT_MODE = "on";
+    const forgetWaits = [];
+    await worker.fetch(request("/v4/memories", {
+      containerTag: "forget-vector-retry",
+      documentId: id,
+    }, "DELETE"), env, { waitUntil: (promise) => forgetWaits.push(promise) });
+    await deleteStarted.promise;
+
+    const restoreWaits = [];
+    await worker.fetch(request("/v3/documents", {
+      containerTag: "forget-vector-retry",
+      customId: "canonical",
+      content: "Restored memory.",
+    }), env, { waitUntil: (promise) => restoreWaits.push(promise) });
+    await Promise.all(restoreWaits);
+    releaseDelete.resolve();
+    await Promise.all(forgetWaits);
+
+    assert.deepEqual(
+      { ...database.prepare(
+        `SELECT is_forgotten, vector_status, vector_mutation_id, vector_attempted_at
+         FROM memories WHERE id = ?`,
+      ).get(id) },
+      {
+        is_forgotten: 0,
+        vector_status: "failed",
+        vector_mutation_id: null,
+        vector_attempted_at: null,
+      },
+    );
+
+    env.MEMORY_VECTORS = {
+      getByIds: async () => [],
+      upsert: async () => {
+        upserts += 1;
+        return { mutationId: "reconciled" };
+      },
+    };
+    const reconcileWaits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => reconcileWaits.push(promise) });
+    await Promise.all(reconcileWaits);
+    assert.equal(upserts, 3);
+    assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "queued");
+  } finally {
+    database.close();
+  }
+});
+
+test("forgotten reconciliation removes an enrichment upsert accepted after forget cleanup", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const upsertStarted = deferred();
+    const releaseUpsert = deferred();
+    let deleteCalls = 0;
+    let storedVector;
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: {
+        run: async (model) => model.includes("bge-m3")
+          ? { data: [embedding()] }
+          : enrichment([], ["Late vector"]),
+      },
+      MEMORY_VECTORS: {
+        upsert: async (vectors) => {
+          upsertStarted.resolve();
+          await releaseUpsert.promise;
+          [storedVector] = vectors;
+          return { mutationId: "late-upsert" };
+        },
+        deleteByIds: async () => {
+          deleteCalls += 1;
+          if (deleteCalls === 2) throw new Error("late cleanup unavailable");
+          storedVector = undefined;
+          return { mutationId: `delete-${deleteCalls}` };
+        },
+        getByIds: async () => storedVector ? [storedVector] : [],
+      },
+    });
+
+    const enrichmentWaits = [];
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "late-forgotten-vector",
+      customId: "canonical",
+      content: "Forget while vector upsert is waiting.",
+    }), env, { waitUntil: (promise) => enrichmentWaits.push(promise) });
+    const { id } = await saved.json();
+    await upsertStarted.promise;
+
+    const forgetWaits = [];
+    await worker.fetch(request("/v4/memories", {
+      containerTag: "late-forgotten-vector",
+      documentId: id,
+    }, "DELETE"), env, { waitUntil: (promise) => forgetWaits.push(promise) });
+    await Promise.all(forgetWaits);
+    releaseUpsert.resolve();
+    await Promise.all(enrichmentWaits);
+
+    assert.equal(storedVector.id, id);
+    assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "pending");
+
+    const reconcileWaits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => reconcileWaits.push(promise) });
+    await Promise.all(reconcileWaits);
+    assert.equal(deleteCalls, 3);
+    assert.equal(storedVector, undefined);
+  } finally {
+    database.close();
+  }
+});
+
+test("AI-disabled forget retries a failed vector deletion during reconciliation", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    let deleteCalls = 0;
+    let storedVector;
+    const env = baseEnvironment(DB, {
+      MEMORY_VECTORS: {
+        deleteByIds: async () => {
+          deleteCalls += 1;
+          if (deleteCalls === 1) throw new Error("Vectorize unavailable");
+          storedVector = undefined;
+          return { mutationId: "retried-delete" };
+        },
+        getByIds: async () => storedVector ? [storedVector] : [],
+      },
+    });
+
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "disabled-forget-vector",
+      customId: "canonical",
+      content: "Stored without enrichment.",
+    }), env, { waitUntil() {} });
+    const { id } = await saved.json();
+    storedVector = { id, values: embedding(), metadata: { topic_revision: "legacy" } };
+
+    const forgetWaits = [];
+    await worker.fetch(request("/v4/memories", {
+      containerTag: "disabled-forget-vector",
+      documentId: id,
+    }, "DELETE"), env, { waitUntil: (promise) => forgetWaits.push(promise) });
+    await Promise.all(forgetWaits);
+    assert.equal(deleteCalls, 1);
+    assert.equal(storedVector.id, id);
+
+    const reconcileWaits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => reconcileWaits.push(promise) });
+    await Promise.all(reconcileWaits);
+    assert.equal(deleteCalls, 2);
+    assert.equal(storedVector, undefined);
+  } finally {
+    database.close();
+  }
+});
+
+test("forgotten reconciliation rechecks an accepted asynchronous delete until the vector disappears", async () => {
+  const database = openDatabase();
+  try {
+    let deleteCalls = 0;
+    let storedVector;
+    const env = baseEnvironment(d1Adapter(database), {
+      MEMORY_VECTORS: {
+        deleteByIds: async () => {
+          deleteCalls += 1;
+          if (deleteCalls === 3) storedVector = undefined;
+          return { mutationId: `delete-${deleteCalls}` };
+        },
+        getByIds: async () => storedVector ? [storedVector] : [],
+      },
+    });
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "async-forget-vector",
+      customId: "canonical",
+      content: "Deletion becomes visible later.",
+    }), env, { waitUntil() {} });
+    const { id } = await saved.json();
+    storedVector = { id, values: embedding(), metadata: { topic_revision: "legacy" } };
+
+    const forgetWaits = [];
+    await worker.fetch(request("/v4/memories", {
+      containerTag: "async-forget-vector",
+      documentId: id,
+    }, "DELETE"), env, { waitUntil: (promise) => forgetWaits.push(promise) });
+    await Promise.all(forgetWaits);
+    assert.equal(deleteCalls, 1);
+
+    for (let pass = 0; pass < 2; pass += 1) {
+      const waits = [];
+      worker.scheduled({}, env, { waitUntil: (promise) => waits.push(promise) });
+      await Promise.all(waits);
+    }
+    assert.equal(deleteCalls, 3);
+    assert.equal(storedVector, undefined);
+  } finally {
+    database.close();
+  }
+});
+
+test("forgotten reconciliation repairs a canonical vector restored after lookup but before bulk delete", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const created = await worker.fetch(request("/v3/documents", {
+      containerTag: "forgotten-scan-restore",
+      customId: "canonical",
+      content: "Original memory.",
+    }), baseEnvironment(DB), { waitUntil() {} });
+    const { id } = await created.json();
+    const originalRevision = database.prepare("SELECT topic_revision FROM memories WHERE id = ?").get(id).topic_revision;
+    database.prepare(
+      "UPDATE memories SET is_forgotten = 1, vector_status = 'pending', vector_attempted_at = NULL WHERE id = ?",
+    ).run(id);
+
+    const lookupStarted = deferred();
+    const releaseLookup = deferred();
+    const oldVector = { id, values: embedding(1, 0), metadata: { topic_revision: originalRevision } };
+    let storedVector = oldVector;
+    let lookups = 0;
+    const upserts = [];
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      AI: {
+        run: async (model) => model.includes("bge-m3")
+          ? { data: [embedding(0, 1)] }
+          : enrichment([], ["Restored"]),
+      },
+      MEMORY_VECTORS: {
+        getByIds: async () => {
+          lookups += 1;
+          if (lookups > 1) return storedVector ? [storedVector] : [];
+          lookupStarted.resolve();
+          await releaseLookup.promise;
+          return [oldVector];
+        },
+        deleteByIds: async () => {
+          storedVector = undefined;
+          return { mutationId: "bulk-delete" };
+        },
+        upsert: async (vectors) => {
+          upserts.push(vectors);
+          [storedVector] = vectors;
+          return { mutationId: `restore-${upserts.length}` };
+        },
+      },
+    });
+
+    const reconcileWaits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => reconcileWaits.push(promise) });
+    await lookupStarted.promise;
+
+    const restoreWaits = [];
+    const restored = await worker.fetch(request("/v3/documents", {
+      containerTag: "forgotten-scan-restore",
+      customId: "canonical",
+      content: "Restored memory.",
+    }), env, { waitUntil: (promise) => restoreWaits.push(promise) });
+    assert.equal((await restored.json()).id, id);
+    await Promise.all(restoreWaits);
+    const restoredRevision = database.prepare("SELECT topic_revision FROM memories WHERE id = ?").get(id).topic_revision;
+    assert.equal(storedVector.metadata.topic_revision, restoredRevision);
+
+    releaseLookup.resolve();
+    await Promise.all(reconcileWaits);
+    assert.notEqual(restoredRevision, originalRevision);
+    assert.equal(upserts.length, 2);
+    assert.equal(storedVector.metadata.topic_revision, restoredRevision);
+    assert.deepEqual(storedVector.values, embedding(0, 1));
+  } finally {
+    database.close();
+  }
+});
+
+test("AI-disabled hard delete still submits vector deletion", async () => {
+  const database = openDatabase();
+  try {
+    let deletedIds;
+    const env = baseEnvironment(d1Adapter(database), {
+      MEMORY_VECTORS: {
+        deleteByIds: async (ids) => {
+          deletedIds = ids;
+          return { mutationId: "hard-delete" };
+        },
+      },
+    });
+    const saved = await worker.fetch(request("/v3/documents", {
+      containerTag: "disabled-hard-delete",
+      customId: "canonical",
+      content: "Stored without enrichment.",
+    }), env, { waitUntil() {} });
+    const { id } = await saved.json();
+
+    const waits = [];
+    const deleted = await worker.fetch(request(`/v3/documents/${id}`, undefined, "DELETE"), env, {
+      waitUntil: (promise) => waits.push(promise),
+    });
+    assert.equal(deleted.status, 204);
+    await Promise.all(waits);
+    assert.deepEqual(deletedIds, [id]);
+    assert.equal(database.prepare("SELECT id FROM memories WHERE id = ?").get(id), undefined);
+  } finally {
+    database.close();
+  }
+});
+
 test("capture reuse ignores forgotten rows and restores a forgotten shared capture", async () => {
   const database = openDatabase();
   try {
@@ -731,6 +1241,55 @@ test("semantic search ignores stale vector revisions and reconciliation replaces
   }
 });
 
+test("vector status and reconciliation split Vectorize lookups into batches of 20", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    database.prepare(
+      "INSERT INTO container_tags(tag, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    ).run("vector-batches", "Vector batches", "2026-01-01", "2026-01-01");
+    const insert = database.prepare(
+      `INSERT INTO memories(
+         id, custom_id, container_tag, content, metadata_json, status, is_forgotten,
+         embedding_status, fact_status, embedding_json, vector_status, topic_status,
+         topic_revision, created_at, updated_at
+       ) VALUES (?, ?, 'vector-batches', 'Stored memory', '{}', 'done', 0,
+         'done', 'done', ?, 'queued', 'done', ?, '2026-01-01', '2026-01-01')`,
+    );
+    for (let index = 0; index < 45; index += 1) {
+      const id = `vector-batch-${index}`;
+      insert.run(id, id, JSON.stringify(embedding()), `revision-${index}`);
+    }
+
+    const batches = [];
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      MEMORY_VECTORS: {
+        describe: async () => ({ name: "test-index" }),
+        getByIds: async (ids) => {
+          assert.ok(ids.length <= 20);
+          batches.push(ids.length);
+          return ids.map((id) => ({ id, metadata: { topic_revision: `revision-${id.slice("vector-batch-".length)}` } }));
+        },
+      },
+    });
+
+    const status = await worker.fetch(request("/v4/vector-status", undefined, "GET"), env, { waitUntil() {} });
+    assert.equal(status.status, 200);
+    assert.equal((await status.json()).visibleActiveVectors, 45);
+    assert.deepEqual(batches, [20, 20, 5]);
+
+    batches.length = 0;
+    const waits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => waits.push(promise) });
+    await Promise.all(waits);
+    assert.deepEqual(batches, [20, 20, 5]);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM memories WHERE vector_status = 'indexed'").get().count, 45);
+  } finally {
+    database.close();
+  }
+});
+
 test("reconciliation status updates cannot overwrite a newer document revision", async () => {
   const database = openDatabase();
   try {
@@ -779,6 +1338,118 @@ test("reconciliation status updates cannot overwrite a newer document revision",
       { ...database.prepare("SELECT embedding_json, vector_status FROM memories WHERE id = ?").get(id) },
       { embedding_json: null, vector_status: "disabled" },
     );
+  } finally {
+    database.close();
+  }
+});
+
+test("reconciliation deletes a stale vector upsert that completes after hard delete", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const created = await worker.fetch(request("/v3/documents", {
+      containerTag: "reconcile-hard-delete",
+      customId: "canonical",
+      content: "Stored memory.",
+    }), baseEnvironment(DB), { waitUntil() {} });
+    const { id } = await created.json();
+    database.prepare(
+      "UPDATE memories SET embedding_json = ?, embedding_status = 'done', vector_status = 'pending' WHERE id = ?",
+    ).run(JSON.stringify(embedding()), id);
+
+    const upsertStarted = deferred();
+    const releaseUpsert = deferred();
+    let deleteCalls = 0;
+    let storedVector = { id, values: embedding(0, 1), metadata: { topic_revision: "stale" } };
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      MEMORY_VECTORS: {
+        getByIds: async () => [storedVector].filter(Boolean),
+        upsert: async (vectors) => {
+          upsertStarted.resolve();
+          await releaseUpsert.promise;
+          [storedVector] = vectors;
+          return { mutationId: "stale-upsert" };
+        },
+        deleteByIds: async () => {
+          deleteCalls += 1;
+          storedVector = undefined;
+          return { mutationId: `delete-${deleteCalls}` };
+        },
+      },
+    });
+
+    const reconcileWaits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => reconcileWaits.push(promise) });
+    await upsertStarted.promise;
+
+    const deleteWaits = [];
+    const deleted = await worker.fetch(request(`/v3/documents/${id}`, undefined, "DELETE"), env, {
+      waitUntil: (promise) => deleteWaits.push(promise),
+    });
+    assert.equal(deleted.status, 204);
+    await Promise.all(deleteWaits);
+    releaseUpsert.resolve();
+    await Promise.all(reconcileWaits);
+
+    assert.equal(deleteCalls, 2);
+    assert.equal(storedVector, undefined);
+    assert.equal(database.prepare("SELECT id FROM memories WHERE id = ?").get(id), undefined);
+  } finally {
+    database.close();
+  }
+});
+
+test("reconciliation repairs a stale upsert when the active revision changes", async () => {
+  const database = openDatabase();
+  try {
+    const DB = d1Adapter(database);
+    const created = await worker.fetch(request("/v3/documents", {
+      containerTag: "reconcile-new-revision",
+      customId: "canonical",
+      content: "Old memory.",
+    }), baseEnvironment(DB), { waitUntil() {} });
+    const { id } = await created.json();
+    const oldRevision = database.prepare("SELECT topic_revision FROM memories WHERE id = ?").get(id).topic_revision;
+    database.prepare(
+      "UPDATE memories SET embedding_json = ?, embedding_status = 'done', vector_status = 'pending' WHERE id = ?",
+    ).run(JSON.stringify(embedding(1, 0)), id);
+
+    const lookupStarted = deferred();
+    const releaseLookup = deferred();
+    const upserts = [];
+    const env = baseEnvironment(DB, {
+      AI_ENRICHMENT_MODE: "on",
+      MEMORY_VECTORS: {
+        getByIds: async () => {
+          lookupStarted.resolve();
+          return releaseLookup.promise;
+        },
+        upsert: async (vectors) => {
+          upserts.push(vectors);
+          return { mutationId: `revision-${upserts.length}` };
+        },
+      },
+    });
+
+    const waits = [];
+    worker.scheduled({}, env, { waitUntil: (promise) => waits.push(promise) });
+    await lookupStarted.promise;
+    const currentRevision = "current-revision";
+    database.prepare(
+      `UPDATE memories
+       SET content = 'Current memory.', embedding_json = ?, vector_status = 'pending', topic_revision = ?
+       WHERE id = ?`,
+    ).run(JSON.stringify(embedding(0, 1)), currentRevision, id);
+    releaseLookup.resolve([{ id, values: embedding(), metadata: { topic_revision: "stale" } }]);
+    await Promise.all(waits);
+
+    assert.notEqual(currentRevision, oldRevision);
+    assert.equal(upserts.length, 2);
+    assert.equal(upserts[0][0].metadata.topic_revision, oldRevision);
+    assert.equal(upserts[1][0].metadata.topic_revision, currentRevision);
+    assert.deepEqual(upserts[1][0].values, embedding(0, 1));
+    assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "queued");
   } finally {
     database.close();
   }
@@ -1030,18 +1701,13 @@ test("a late old vector upsert is repaired while the current D1 revision stays a
     releaseOldUpsert.resolve();
     await Promise.all(oldWaits);
     assert.notEqual(oldRevision, currentRevision);
-    assert.equal(storedVector.metadata.topic_revision, oldRevision);
-    assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "indexed");
-
-    waits = [];
-    worker.scheduled({}, env, { waitUntil: (promise) => waits.push(promise) });
-    await Promise.all(waits);
     assert.equal(storedVector.metadata.topic_revision, currentRevision);
     assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "queued");
 
     waits = [];
     worker.scheduled({}, env, { waitUntil: (promise) => waits.push(promise) });
     await Promise.all(waits);
+    assert.equal(storedVector.metadata.topic_revision, currentRevision);
     assert.equal(database.prepare("SELECT vector_status FROM memories WHERE id = ?").get(id).vector_status, "indexed");
   } finally {
     database.close();

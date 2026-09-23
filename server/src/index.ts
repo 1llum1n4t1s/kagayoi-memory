@@ -11,6 +11,9 @@ const UNCLASSIFIED_TOPIC = "__unclassified__";
 const MAX_EMBEDDING_CONTENT_LENGTH = 60_000;
 const MAX_FACT_CONTENT_LENGTH = 24_000;
 const MAX_D1_VECTOR_SCAN = 200;
+const MAX_VECTOR_GET_IDS = 20;
+const MAX_VECTOR_DELETE_REPAIR_ATTEMPTS = 3;
+const MAX_FORGOTTEN_VECTOR_SCAN = 100;
 const MAX_INDEX_LEXICAL_SCAN = 1_000;
 const EMBEDDING_MODEL = "@cf/baai/bge-m3" as const;
 const FACT_MODEL = "@cf/zai-org/glm-4.7-flash" as const;
@@ -1110,7 +1113,9 @@ async function persistConsolidation(
       ...previousBindings,
     ),
     env.DB.prepare(
-      `UPDATE memories SET status = 'superseded', is_forgotten = 1, updated_at = ?
+      `UPDATE memories
+       SET status = 'superseded', is_forgotten = 1, vector_status = 'pending',
+           vector_mutation_id = NULL, vector_attempted_at = NULL, updated_at = ?
        WHERE id IN (
          SELECT memory_id FROM memory_consolidations
          WHERE project_key = ? AND status = 'active'
@@ -1281,7 +1286,9 @@ async function invalidateDependentConsolidations(
        WHERE active_consolidation_id IN (${placeholders})`,
     ).bind(now, ...ids),
     env.DB.prepare(
-      `UPDATE memories SET status = 'superseded', is_forgotten = 1, updated_at = ?
+      `UPDATE memories
+       SET status = 'superseded', is_forgotten = 1, vector_status = 'pending',
+           vector_mutation_id = NULL, vector_attempted_at = NULL, updated_at = ?
        WHERE id IN (SELECT memory_id FROM memory_consolidations WHERE id IN (${placeholders}))`,
     ).bind(now, ...ids),
     env.DB.prepare(
@@ -1326,7 +1333,9 @@ async function hardDeleteMemory(id: string, env: Env, ctx: ExecutionContext): Pr
        )`,
     ).bind(id, id),
     env.DB.prepare(
-      `UPDATE memories SET status = 'superseded', is_forgotten = 1, updated_at = ?
+      `UPDATE memories
+       SET status = 'superseded', is_forgotten = 1, vector_status = 'pending',
+           vector_mutation_id = NULL, vector_attempted_at = NULL, updated_at = ?
        WHERE id IN (
          SELECT consolidation.memory_id FROM memory_consolidations AS consolidation
          WHERE consolidation.status = 'active' AND ${dependency}
@@ -1344,12 +1353,14 @@ async function hardDeleteMemory(id: string, env: Env, ctx: ExecutionContext): Pr
      WHERE status = 'invalid' AND updated_at = ?`,
   ).bind(now).all<{ memoryId: string }>();
   await restoreUnsupportedFacts(env, current.container_tag);
-  if (enrichmentEnabled(env)) {
-    const vectorIds = [...new Set([id, ...invalidated.results.map((row) => row.memoryId)])];
-    ctx.waitUntil(env.MEMORY_VECTORS.deleteByIds(vectorIds).catch((error) => {
-      console.error(JSON.stringify({ event: "vector_delete_failed", memoryIds: vectorIds, error: String(error) }));
-    }));
-  }
+  const vectorIds = [...new Set([id, ...invalidated.results.map((row) => row.memoryId)])];
+  ctx.waitUntil(
+    Promise.resolve()
+      .then(() => env.MEMORY_VECTORS.deleteByIds(vectorIds))
+      .catch((error) => {
+        console.error(JSON.stringify({ event: "vector_delete_failed", memoryIds: vectorIds, error: String(error) }));
+      }),
+  );
   return new Response(null, { status: 204 });
 }
 
@@ -1620,13 +1631,16 @@ async function enrichMemory(memory: EnrichmentMemory, env: Env): Promise<void> {
             mutation,
           }),
         );
-        await env.DB.prepare(
+        const vectorUpdate = await env.DB.prepare(
           `UPDATE memories
            SET vector_status = 'queued', vector_mutation_id = ?, vector_attempted_at = ?
            WHERE id = ? AND updated_at = ? AND topic_revision = ? AND is_forgotten = 0`,
         )
           .bind(vectorMutationId(mutation), attemptedAt, memory.id, memory.updatedAt, memory.topicRevision)
           .run();
+        if ((vectorUpdate.meta.changes ?? 0) === 0) {
+          await deleteVectorAfterStaleUpsert(memory.id, env);
+        }
       } catch (error) {
         errors.push(`vector index: ${String(error)}`);
         await env.DB.prepare(
@@ -2327,6 +2341,70 @@ async function retryEnrichment(
   }, 202);
 }
 
+async function getVectorsByIds(env: Env, ids: string[]): Promise<VectorizeVector[]> {
+  const vectors: VectorizeVector[] = [];
+  for (let offset = 0; offset < ids.length; offset += MAX_VECTOR_GET_IDS) {
+    vectors.push(...await env.MEMORY_VECTORS.getByIds(ids.slice(offset, offset + MAX_VECTOR_GET_IDS)));
+  }
+  return vectors;
+}
+
+async function reconcileForgottenVectors(env: Env): Promise<void> {
+  const result = await env.DB.prepare(
+    `SELECT id FROM memories
+     WHERE is_forgotten = 1
+     ORDER BY COALESCE(vector_attempted_at, updated_at) ASC
+     LIMIT ?`,
+  ).bind(MAX_FORGOTTEN_VECTOR_SCAN).all<{ id: string }>();
+  if (result.results.length === 0) return;
+
+  const ids = result.results.map((row) => row.id);
+  const attemptedAt = new Date().toISOString();
+  let visible: VectorizeVector[] = [];
+  try {
+    visible = await getVectorsByIds(env, ids);
+  } catch (error) {
+    await env.DB.batch(ids.map((id) => env.DB.prepare(
+      `UPDATE memories
+       SET vector_status = 'pending', vector_attempted_at = ?
+       WHERE id = ? AND is_forgotten = 1`,
+    ).bind(attemptedAt, id)));
+    console.error(JSON.stringify({ event: "forgotten_vector_lookup_failed", memoryIds: ids, error: String(error) }));
+    return;
+  }
+
+  const visibleIds = new Set(visible.map((vector) => vector.id));
+  let mutation: unknown = null;
+  let deleteFailed = false;
+  if (visibleIds.size > 0) {
+    try {
+      mutation = await env.MEMORY_VECTORS.deleteByIds([...visibleIds]);
+      for (const id of visibleIds) await repairActiveVectorAfterDelete(id, env);
+    } catch (error) {
+      deleteFailed = true;
+      console.error(JSON.stringify({
+        event: "forgotten_vector_delete_failed",
+        memoryIds: [...visibleIds],
+        error: String(error),
+      }));
+    }
+  }
+
+  await env.DB.batch(ids.map((id) => {
+    const visibleStatus = deleteFailed ? "pending" : "queued";
+    return env.DB.prepare(
+      `UPDATE memories
+       SET vector_status = ?, vector_mutation_id = ?, vector_attempted_at = ?
+       WHERE id = ? AND is_forgotten = 1`,
+    ).bind(
+      visibleIds.has(id) ? visibleStatus : "disabled",
+      visibleIds.has(id) && !deleteFailed ? vectorMutationId(mutation) : null,
+      attemptedAt,
+      id,
+    );
+  }));
+}
+
 async function vectorStatus(env: Env): Promise<Response> {
   const [index, statuses, activeIds] = await Promise.all([
     env.MEMORY_VECTORS.describe(),
@@ -2340,7 +2418,7 @@ async function vectorStatus(env: Env): Promise<Response> {
   ]);
   const visible =
     activeIds.results.length > 0
-      ? await env.MEMORY_VECTORS.getByIds(activeIds.results.map((row) => row.id))
+      ? await getVectorsByIds(env, activeIds.results.map((row) => row.id))
       : [];
   return json({
     index,
@@ -2351,6 +2429,7 @@ async function vectorStatus(env: Env): Promise<Response> {
 }
 
 async function reconcileVectors(env: Env): Promise<void> {
+  await reconcileForgottenVectors(env);
   if (!enrichmentEnabled(env)) return;
   const result = await env.DB.prepare(
     `SELECT id, container_tag, embedding_json, vector_attempted_at, topic_revision FROM (
@@ -2375,7 +2454,7 @@ async function reconcileVectors(env: Env): Promise<void> {
   if (result.results.length === 0) return;
 
   const ids = result.results.map((row) => row.id);
-  const existing = await env.MEMORY_VECTORS.getByIds(ids);
+  const existing = await getVectorsByIds(env, ids);
   const existingById = new Map(existing.map((vector) => [vector.id, vector]));
   const now = new Date();
   const retryBefore = now.getTime() - 10 * 60 * 1_000;
@@ -2419,16 +2498,26 @@ async function reconcileVectors(env: Env): Promise<void> {
     try {
       const mutation = await env.MEMORY_VECTORS.upsert(vectors);
       const attemptedAt = now.toISOString();
+      const statusUpdates: Array<{ id: string; statement: D1PreparedStatement }> = [];
       for (const vector of vectors) {
         const row = result.results.find((candidate) => candidate.id === vector.id);
         if (!row) continue;
-        updates.push(
-          env.DB.prepare(
+        statusUpdates.push({
+          id: vector.id,
+          statement: env.DB.prepare(
             `UPDATE memories
              SET vector_status = 'queued', vector_mutation_id = ?, vector_attempted_at = ?
              WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0`,
           ).bind(vectorMutationId(mutation), attemptedAt, vector.id, row.topic_revision),
-        );
+        });
+      }
+      const statusResults = await env.DB.batch(statusUpdates.map(({ statement }) => statement));
+      for (let index = 0; index < statusUpdates.length; index += 1) {
+        const statusUpdate = statusUpdates[index];
+        if (!statusUpdate) continue;
+        if ((statusResults[index]?.meta.changes ?? 0) === 0) {
+          await deleteVectorAfterStaleUpsert(statusUpdate.id, env);
+        }
       }
       console.log(
         JSON.stringify({
@@ -2826,13 +2915,101 @@ async function removeDerivedMemory(
     env.DB.prepare("DELETE FROM memory_topics WHERE memory_id = ?").bind(id),
   ]);
   await restoreUnsupportedFacts(env, containerTag);
-  if (enrichmentEnabled(env)) {
-    ctx.waitUntil(
-      env.MEMORY_VECTORS.deleteByIds([id]).catch((error) => {
-        console.error(JSON.stringify({ event: "vector_delete_failed", memoryId: id, error: String(error) }));
-      }),
-    );
+  ctx.waitUntil(
+    deleteForgottenVector(id, env).catch((error) => {
+      console.error(JSON.stringify({ event: "vector_delete_failed", memoryId: id, error: String(error) }));
+    }),
+  );
+}
+
+async function deleteVectorAfterStaleUpsert(id: string, env: Env): Promise<void> {
+  const current = await env.DB.prepare("SELECT is_forgotten FROM memories WHERE id = ?")
+    .bind(id)
+    .first<Pick<MemoryRow, "is_forgotten">>();
+  if (current?.is_forgotten === 0) {
+    await repairActiveVectorAfterDelete(id, env, "upsert");
+    return;
   }
+  if (current) {
+    await env.DB.prepare(
+      `UPDATE memories
+       SET vector_status = 'pending', vector_mutation_id = NULL, vector_attempted_at = NULL
+       WHERE id = ? AND is_forgotten = 1`,
+    ).bind(id).run();
+  }
+  try {
+    await deleteForgottenVector(id, env);
+  } catch (error) {
+    console.error(JSON.stringify({ event: "late_vector_delete_failed", memoryId: id, error: String(error) }));
+  }
+}
+
+async function deleteForgottenVector(id: string, env: Env): Promise<void> {
+  await env.MEMORY_VECTORS.deleteByIds([id]);
+  await repairActiveVectorAfterDelete(id, env);
+}
+
+async function repairActiveVectorAfterDelete(
+  id: string,
+  env: Env,
+  lastMutation: "delete" | "upsert" = "delete",
+): Promise<void> {
+
+  for (let attempt = 0; attempt < MAX_VECTOR_DELETE_REPAIR_ATTEMPTS; attempt += 1) {
+    const current = await env.DB.prepare(
+      `SELECT container_tag, metadata_json, is_forgotten, embedding_json, topic_revision
+       FROM memories WHERE id = ?`,
+    ).bind(id).first<Pick<
+      MemoryRow,
+      "container_tag" | "metadata_json" | "is_forgotten" | "embedding_json" | "topic_revision"
+    >>();
+    const values = current?.is_forgotten === 0 && automaticEnrichmentAllowed(parseMetadata(current.metadata_json))
+      ? parseEmbedding(current.embedding_json)
+      : null;
+    if (!current || !values) {
+      if (lastMutation === "delete") return;
+      await env.MEMORY_VECTORS.deleteByIds([id]);
+      lastMutation = "delete";
+      continue;
+    }
+
+    const attemptedAt = new Date().toISOString();
+    let mutation: unknown;
+    try {
+      mutation = await env.MEMORY_VECTORS.upsert([{
+        id,
+        values,
+        namespace: await vectorNamespace(current.container_tag),
+        metadata: { topic_revision: vectorRevision(current.topic_revision) },
+      }]);
+    } catch (error) {
+      await env.DB.prepare(
+        `UPDATE memories
+         SET vector_status = 'failed', vector_mutation_id = NULL, vector_attempted_at = NULL,
+             enrichment_error = ?
+         WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0`,
+      ).bind(`vector restore after delete: ${String(error)}`.slice(0, 2_000), id, current.topic_revision).run();
+      console.error(JSON.stringify({ event: "vector_restore_after_delete_failed", memoryId: id, error: String(error) }));
+      return;
+    }
+    lastMutation = "upsert";
+
+    const updated = await env.DB.prepare(
+      `UPDATE memories
+       SET vector_status = 'queued', vector_mutation_id = ?, vector_attempted_at = ?
+       WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0`,
+    ).bind(vectorMutationId(mutation), attemptedAt, id, current.topic_revision).run();
+    if ((updated.meta.changes ?? 0) > 0) return;
+  }
+
+  await env.MEMORY_VECTORS.deleteByIds([id]);
+  await env.DB.prepare(
+    `UPDATE memories
+     SET vector_status = 'pending', vector_mutation_id = NULL, vector_attempted_at = NULL
+     WHERE id = ? AND is_forgotten = 0 AND embedding_json IS NOT NULL
+       AND json_extract(metadata_json, '$.memoryIndex.recallable') IS NOT 0`,
+  ).bind(id).run();
+  console.warn(JSON.stringify({ event: "vector_restore_after_delete_deferred", memoryId: id }));
 }
 
 async function forgetMemory(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -2855,7 +3032,10 @@ async function forgetMemory(request: Request, env: Env, ctx: ExecutionContext): 
     ).bind(containerTag, content).first<{ id: string }>();
   if (!row) return json({ id: null, message: "No matching memory found" });
   const updated = await env.DB.prepare(
-    "UPDATE memories SET is_forgotten = 1, updated_at = ? WHERE id = ? AND container_tag = ? AND is_forgotten = 0",
+    `UPDATE memories
+     SET is_forgotten = 1, vector_status = 'pending', vector_mutation_id = NULL,
+         vector_attempted_at = NULL, updated_at = ?
+     WHERE id = ? AND container_tag = ? AND is_forgotten = 0`,
   ).bind(new Date().toISOString(), row.id, containerTag).run();
   if ((updated.meta.changes ?? 0) === 0) return json({ id: null, message: "No matching memory found" });
   await invalidateDependentConsolidations(row.id, env, ctx);
