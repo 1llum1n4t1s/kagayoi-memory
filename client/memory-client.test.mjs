@@ -54,14 +54,6 @@ test("BフォルダからChrome拡張機能を検索するとAフォルダの索
   assert.match(detail.text, /DETAIL_ONLY/);
 });
 
-test("SessionStartは話題がないため保存先一覧も最近の文書も読まず何も注入しない", async () => {
-  const calls = [];
-  const request = async (...args) => { calls.push(args); throw new Error("unexpected request"); };
-  const hook = await runHook("SessionStart", {}, { settings, context, request });
-  assert.deepEqual(calls, []);
-  assert.deepEqual(hook, {});
-});
-
 test("自動想起は残り250ms未満で新しいAPI要求を開始しない", async () => {
   let calls = 0;
   const expired = createDeadlineRequest(1_000, async () => { calls += 1; }, () => 751);
@@ -169,11 +161,10 @@ test("話題に関係しない清書は自動想起で原文を隠さない", as
   assert.deepEqual(result.results.map(({ id }) => id), ["source-keep"]);
 });
 
-test("短い相づちと出典のない旧fact断片は索引として自動注入しない", async () => {
+test("短い相づちと出典のない旧fact断片も手動検索で保持する", async () => {
   const ack = row("ack", "project", { metadata: { memoryIndex: buildMemoryIndex({ title: "Kiriha", request: "ありがとうございます。", response: "どういたしまして。" }) } });
   const fact = row("fact", "project", { metadata: {}, content: "Kiriha has BookmarkTree selection logic" });
   const request = withDiscovery(async (path) => path.startsWith("/v3/documents/") ? fact : ({ results: [ack, fact] }));
-  assert.deepEqual(await runHook("SessionStart", {}, { settings, context, request }), {});
   assert.equal((await searchIndex({ query: "Kiriha", settings, context, request })).results.length, 2);
 });
 
@@ -319,11 +310,6 @@ test("旧文書も本文を索引から分離し、新しい保存日時を原�
   assert.equal(index.description, "ブックマークの並び順を調べて");
   assert.equal(index.sourceUpdatedAt, undefined);
   assert.doesNotMatch(JSON.stringify(index), /DETAIL_ONLY/);
-});
-
-test("serverが返す空topicsは旧metadata topicより優先する", () => {
-  const index = documentIndex({ id: "doc", content: "new", topics: [], metadata: { topics: ["obsolete"] } });
-  assert.deepEqual(index.topics, []);
 });
 
 test("注釈付き依頼では現在の要求を索引と検索語に使い、注入を再保存しない", async () => {

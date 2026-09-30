@@ -4,7 +4,8 @@ import { readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { CONFIG_FILE_NAME, LEGACY_CONFIG_FILE_NAME, getProjectContext, loadConfig } from "./Import-KagayoiMemoryHistory.mjs";
-import { documentIndex, formatIndexItem, publicIndex } from "./memory-index.mjs";
+import { documentIndex, formatIndexItem, matchingTopicTerms, publicIndex } from "./memory-index.mjs";
+import { truncateUtf16 } from "./unicode-text.mjs";
 
 const hash = (text) => createHash("sha256").update(text).digest("hex").slice(0, 16);
 const unique = (values) => [...new Set(values.filter((v) => typeof v === "string" && v.trim()).map((v) => v.trim()))];
@@ -15,10 +16,16 @@ function git(args, cwd) {
 
 export function readSettings(codexHome = process.env.CODEX_HOME || join(homedir(), ".codex")) {
   let config = {};
-  try { config = JSON.parse(readFileSync(join(codexHome, CONFIG_FILE_NAME), "utf8")); }
+  try {
+    config = JSON.parse(readFileSync(join(codexHome, CONFIG_FILE_NAME), "utf8"));
+    if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("invalid configuration");
+  }
   catch {
-    try { config = JSON.parse(readFileSync(join(codexHome, LEGACY_CONFIG_FILE_NAME), "utf8")); }
-    catch { /* 認証のエラーはAPI接続時に通知する。 */ }
+    try {
+      config = JSON.parse(readFileSync(join(codexHome, LEGACY_CONFIG_FILE_NAME), "utf8"));
+      if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("invalid configuration");
+    }
+    catch { config = {}; /* 認証のエラーはAPI接続時に通知する。 */ }
   }
   return {
     codexHome,
@@ -75,12 +82,33 @@ export async function api(path, { body, method = body ? "POST" : "GET", timeoutM
 }
 
 const STOP_WORDS = new Set(["memory", "memories", "codex", "情報", "こと", "もの", "これ", "それ", "この", "その", "あの", "どの", "ここ", "そこ", "this", "that", "ため", "よう", "です", "ます", "ください", "する", "した", "して", "れる", "ある", "いる", "確認", "対応", "作業", "実装", "調査"]);
+const AUTOMATIC_STOP_WORDS = new Set(["修正", "改善", "最適化", "機能", "部分", "発見", "でき", "出来", "てい", "いた", "たら", "そう", "お願い", "お願いします", "please", "fix", "improve", "optimize", "optimization", "implement", "implementation", "investigate"]);
+const querySegmenter = new Intl.Segmenter("ja", { granularity: "word" });
 const SEARCH_CONCURRENCY = 8;
-export function queryTerms(query) {
-  const segmenter = new Intl.Segmenter("ja", { granularity: "word" });
-  const words = [...segmenter.segment(query)].filter((segment) => segment.isWordLike)
+function automaticSearchText(query) {
+  const pathTopic = (path) => {
+    const normalized = path.replace(/\\/gu, "/").replace(/\/+$/u, "");
+    let parts = normalized.replace(/^[a-z]:\//iu, "").split("/").filter(Boolean);
+    if (normalized.startsWith("//")) parts = parts.slice(2);
+    else if (/^(?:users|home)$/iu.test(parts[0] || "")) parts = parts.slice(2);
+    else if (parts[0] === "~") parts = parts.slice(1);
+    const workspace = parts.findIndex((part) => /^(?:dev|projects?|workspaces?|repos?|work)$/iu.test(part));
+    if (workspace !== -1) return parts[workspace + 1] || "";
+    return parts.at(-1) || "";
+  };
+  // 端末・アカウント名を除き、ファイルパスでも所属プロジェクトを残す。
+  return query.normalize("NFKC")
+    .replace(/(["'])([a-z]:[\\/][^\r\n]*?|\\\\[^"'\r\n]*?|\/[^\r\n]*?)\1/giu, (_match, _quote, path) => pathTopic(path))
+    .replace(/\b[a-z]:[\\/][^\s"'<>|]+|\\\\[^\s"'<>|]+|(?<![:\w/])(?:~)?\/[^\s"'<>|]+/giu, (path) => pathTopic(path));
+}
+export function queryTerms(query, { automatic = false } = {}) {
+  if (automatic) query = automaticSearchText(query);
+  const identifiers = automatic ? [...query.matchAll(/\b[a-z\d]+(?:[._-][a-z\d]+)+\b/giu)] : [];
+  const words = [...querySegmenter.segment(query)].filter((segment) => segment.isWordLike &&
+    !identifiers.some((identifier) => segment.index >= identifier.index && segment.index < identifier.index + identifier[0].length))
     .map((segment) => ({ value: segment.segment.toLowerCase(), index: segment.index, end: segment.index + segment.segment.length }));
-  const useful = words.filter(({ value }) => value.length >= 2 && !STOP_WORDS.has(value));
+  const stopped = (value) => STOP_WORDS.has(value) || automatic && AUTOMATIC_STOP_WORDS.has(value);
+  const useful = words.filter(({ value }) => value.length >= 2 && !stopped(value));
   const japanese = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}ー]+$/u;
   const compounds = [];
   const compounded = new Set();
@@ -92,12 +120,13 @@ export function queryTerms(query) {
     compounded.add(current.value);
     compounded.add(next.value);
   }
-  return unique([...useful.filter(({ value }) => !compounded.has(value)).map(({ value }) => value), ...compounds]).slice(0, 30);
+  return unique([...identifiers.map((identifier) => identifier[0].toLowerCase()),
+    ...useful.filter(({ value }) => !compounded.has(value)).map(({ value }) => value), ...compounds])
+    .filter((value) => !stopped(value)).slice(0, 30);
 }
 
 function matchingTerms(index, terms, withExcerpt = true) {
-  const topic = `${index.title} ${index.description} ${(index.sections || []).join(" ")} ${(index.topics || []).join(" ")} ${withExcerpt ? index.searchExcerpt || "" : ""}`.toLowerCase();
-  return terms.filter((term) => topic.includes(term));
+  return matchingTopicTerms(`${index.title} ${index.description} ${(index.sections || []).join(" ")} ${(index.topics || []).join(" ")} ${withExcerpt ? index.searchExcerpt || "" : ""}`, terms);
 }
 
 function topicRelevance(index, terms, withExcerpt = true) {
@@ -146,7 +175,8 @@ async function mapConcurrent(values, concurrency, task) {
 }
 
 export async function searchIndex({ query = "", containerTag, cwd, settings = readSettings(), context, limit = settings.maxMemories, request = api, automatic = false } = {}) {
-  query = typeof query === "string" ? query.trim().slice(0, 1_000) : "";
+  query = typeof query === "string" ? truncateUtf16(query.trim(), 1_000) : "";
+  if (automatic) query = automaticSearchText(query);
   if (!query) return { query, containerTag: containerTag || null, searchScope: "none", searchedContainers: [], failedContainers: [], failedDocuments: [], spaceDiscoveryComplete: true, results: [], total: 0 };
   let globalResponse;
   if (!containerTag) {
@@ -179,7 +209,7 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
   });
   const failedTags = globalResponse ? [] : tags.filter((_, i) => results[i].status === "rejected");
   if (tags.length && failedTags.length === tags.length) throw new Error("Kagayoi Memory search unavailable for all requested spaces");
-  const terms = queryTerms(query);
+  const terms = queryTerms(query, { automatic });
   const rawCandidates = results.flatMap((r) => r.status === "fulfilled" ? r.value : []).filter(({ row, index }) => {
     if (!index.id || !index.containerTag) return false;
     // indexOnly応答では旧文書の本文が無いため、関連度は詳細取得後に判定する。

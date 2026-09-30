@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { captureStage, markCaptureFailure, captureFailureMessage } from "./capture-diagnostics.mjs";
 import { api, loadConfig, getProjectContext, listJsonlFiles, readSessionMeta,
   chooseCandidates, parseTaskTranscript, readTaskTitles, buildTurnDocuments, sanitizeText } from "./Import-KagayoiMemoryHistory.mjs";
 
@@ -25,9 +26,14 @@ export async function findTranscript(payload, codexHome) {
 
 function readReceipts(statePath) {
   if (!existsSync(statePath)) return new Set();
-  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  let text;
+  try { text = readFileSync(statePath, "utf8"); }
+  catch (error) { throw markCaptureFailure(error, "receipt-read"); }
+  let state;
+  try { state = JSON.parse(text); }
+  catch (error) { throw markCaptureFailure(error, "receipt-invalid"); }
   if (!Array.isArray(state) || state.some((receipt) => typeof receipt !== "string" || !receipt)) {
-    throw new Error("Invalid capture receipts.");
+    throw markCaptureFailure(new Error("Invalid capture receipts."), "receipt-invalid");
   }
   return new Set(state);
 }
@@ -76,13 +82,13 @@ async function recordReceipt(statePath, legacyStatePath, customId) {
 
 export async function capture(payload, { codexHome = process.env.CODEX_HOME || join(homedir(), ".codex"),
   config, send, budgetMs = 90_000 } = {}) {
-  config ||= loadConfig(codexHome);
-  const candidate = await findTranscript(payload, codexHome);
+  config ||= await captureStage("configuration", () => loadConfig(codexHome));
+  const candidate = await captureStage("transcript", () => findTranscript(payload, codexHome));
   const cwd = candidate.meta.cwd || payload.cwd;
-  if (!cwd) throw new Error("Missing project path.");
-  const project = getProjectContext(cwd);
-  const transcript = await parseTaskTranscript(candidate.filePath, [config.apiKey]);
-  const titles = await readTaskTitles(codexHome);
+  if (!cwd) throw markCaptureFailure(new Error("Missing project path."), "transcript");
+  const project = await captureStage("transcript", () => getProjectContext(cwd));
+  const transcript = await captureStage("transcript", () => parseTaskTranscript(candidate.filePath, [config.apiKey]));
+  const titles = await captureStage("transcript", () => readTaskTitles(codexHome));
   const title = sanitizeText(titles.get(candidate.meta.id) || "", [config.apiKey], { count: 0 });
   const documents = buildTurnDocuments(candidate, transcript, project, title);
   // 応答を確認した文書だけ記録する。中断後の再送も同じcustomIdなので上書き損失は起きない。
@@ -97,11 +103,13 @@ export async function capture(payload, { codexHome = process.env.CODEX_HOME || j
   let saved = 0;
   for (const document of pending) {
     if (Date.now() - started >= budgetMs) break;
-    const result = await (send ? send(document) : api(config, "/v3/documents", { method: "POST", body: document }));
-    if (!result || typeof result.id !== "string" || !result.id) throw new Error("Memory API did not acknowledge the document.");
+    const result = await captureStage("transport", () => send ? send(document) : api(config, "/v3/documents", { method: "POST", body: document }));
+    if (!result || typeof result.id !== "string" || !result.id) throw markCaptureFailure(new Error("Memory API did not acknowledge the document."), "acknowledgement");
     receipts.add(document.customId);
-    mkdirSync(stateDirectory, { recursive: true });
-    await recordReceipt(statePath, legacyStatePath, document.customId);
+    await captureStage("receipt-write", async () => {
+      mkdirSync(stateDirectory, { recursive: true });
+      await recordReceipt(statePath, legacyStatePath, document.customId);
+    });
     saved += 1;
   }
   return { saved, pending: pending.length - saved, completedTurns: transcript.turns.length };
@@ -109,14 +117,14 @@ export async function capture(payload, { codexHome = process.env.CODEX_HOME || j
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
-    const payload = JSON.parse(readFileSync(0, "utf8"));
+    const payload = await captureStage("payload", () => JSON.parse(readFileSync(0, "utf8")));
     const result = await capture(payload);
     if (result.saved || result.pending) process.stdout.write(JSON.stringify({
       systemMessage: `Kagayoi Memory: saved ${result.saved} documents; pending ${result.pending}.`,
     }));
-  } catch {
+  } catch (error) {
     // 本文・接続設定・HTTP応答をログへ出さず、失敗は呼び出し元に通知する。
-    process.stderr.write("Kagayoi Memory capture failed; unacknowledged records will be retried.\n");
+    process.stderr.write(captureFailureMessage(error));
     process.exitCode = 1;
   }
 }

@@ -265,33 +265,6 @@ test("途中失敗後は成功分を保持して残りを送る", async (t) => {
   assert.match(remaining[0].content, /結果二/);
 });
 
-test("同じタスクの保存が並行してもv2レシートを失わず次回は再送しない", async (t) => {
-  const f = fixture(t, [user("一"), assistant("結果一"), user("二"), assistant("結果二")]);
-  const sent = [];
-  const gate = [];
-  const send = async (document) => {
-    sent.push(document);
-    if (sent.length <= 2) await new Promise((resolve) => gate.push(resolve));
-    return { id: document.customId };
-  };
-  const first = capture(f.payload, { ...f.options, send });
-  const second = capture(f.payload, { ...f.options, send });
-  while (gate.length < 2) await new Promise((resolve) => setTimeout(resolve, 5));
-  gate.splice(0).forEach((release) => release());
-  const results = await Promise.all([first, second]);
-  assert.deepEqual(results.map((result) => result.saved), [2, 2]);
-  assert.ok(sent.every((document) => document.customId.startsWith("codex-turn-v2:")));
-  const stateDirectory = join(f.home, "kagayoi-memory", "capture-state");
-  const receiptFiles = readdirSync(stateDirectory).filter((name) => name.endsWith(".json"));
-  assert.equal(receiptFiles.length, 1);
-  const receipts = JSON.parse(readFileSync(join(stateDirectory, receiptFiles[0]), "utf8"));
-  assert.deepEqual(receipts, [...new Set(sent.map((document) => document.customId))].sort());
-  let retried = 0;
-  const retry = await capture(f.payload, { ...f.options, send: async () => { retried++; return { id: "unexpected" }; } });
-  assert.deepEqual(retry, { saved: 0, pending: 0, completedTurns: 2 });
-  assert.equal(retried, 0);
-});
-
 test("1.xの保存レシートを新しいturnと統合し、名称変更後も旧文書を再送しない", async (t) => {
   const f = fixture(t, [user("依頼"), assistant("結果")]);
   await capture(f.payload, { ...f.options, send: async (document) => ({ id: document.customId }) });

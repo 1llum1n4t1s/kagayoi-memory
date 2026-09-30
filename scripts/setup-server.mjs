@@ -5,6 +5,7 @@ import { constants as fsConstants } from "node:fs";
 import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { truncateUtf16 } from "../client/unicode-text.mjs";
 
 const EXPECTED_VECTOR_DIMENSIONS = 1_024;
 const EXPECTED_VECTOR_METRIC = "cosine";
@@ -226,7 +227,7 @@ async function callWrangler(context, args, label, { input, allowFailure = false 
   if (result.code !== 0 && !allowFailure) {
     const details = label === "setting MEMORY_API_KEY"
       ? ""
-      : redact((result.stderr || result.stdout).trim(), context.apiKey).slice(0, 2_000);
+      : truncateUtf16(redact((result.stderr || result.stdout).trim(), context.apiKey), 2_000);
     throw new SetupError(`Wrangler failed while ${label}.${details ? `\n${details}` : ""}`);
   }
   return result;

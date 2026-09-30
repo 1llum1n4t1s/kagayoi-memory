@@ -1,16 +1,33 @@
 // 保存時と読出時で同じ索引を作る。要約を新しい事実として生成せず、原文への入口だけを残す。
+import { truncateUtf16 } from "./unicode-text.mjs";
+
 const INDEX_VERSION = 1;
 const compact = (value) => typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
 
-export function shortText(value, limit = 160) {
-  const text = compact(value).replace(/<[^>]*>/g, "");
-  return text.length <= limit ? text : `${text.slice(0, limit - 1).trimEnd()}…`;
+export function matchingTopicTerms(text, terms) {
+  const normalize = (value) => value.normalize("NFKC").toLowerCase().replace(/[._-]+/gu, " ");
+  const topic = normalize(text);
+  return terms.filter((value) => {
+    const term = normalize(value);
+    if (!/^[a-z\d ]+$/u.test(term)) return topic.includes(term);
+    // 語の断片は除外し、バージョン未指定の .NET と .NET8 は対応させる。
+    const after = /\d$/u.test(term) ? /[a-z\d]/u : /[a-z]/u;
+    for (let position = topic.indexOf(term); position !== -1; position = topic.indexOf(term, position + 1)) {
+      if (!/[a-z\d]/u.test(topic[position - 1] || "") && !after.test(topic[position + term.length] || "")) return true;
+    }
+    return false;
+  });
 }
 
-const promptText = (value, limit = 160) => shortText(value, limit)
+export function shortText(value, limit = 160) {
+  const text = compact(value).replace(/<[^>]*>/g, "");
+  return text.length <= limit ? text : `${truncateUtf16(text, limit - 1).trimEnd()}…`;
+}
+
+const promptText = (value, limit = 160) => shortText(shortText(value, limit)
   .replace(/&/g, "&amp;")
   .replace(/</g, "&lt;")
-  .replace(/>/g, "&gt;");
+  .replace(/>/g, "&gt;"), limit);
 
 function plainLine(line) {
   return line.replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s*)/, "")
@@ -63,7 +80,7 @@ function matchingSection(content, terms) {
   let best = 0;
   for (const heading of headings) {
     if (/^Codex saved memory import:/i.test(heading[2])) continue;
-    const matches = terms.filter((term) => heading[2].toLowerCase().includes(term)).length;
+    const matches = matchingTopicTerms(heading[2], terms).length;
     if (matches > best) { best = matches; selected = heading; }
   }
   if (!selected) return content;
@@ -167,7 +184,7 @@ export function formatIndexItem(item) {
   const parts = item.parts > 1 ? ` | part=${item.part}/${item.parts}` : "";
   const kind = item.consolidation ? " | kind=consolidated-checkpoint" : "";
   const excerpt = item.searchExcerpt ? `\n  原文の該当箇所: ${promptText(item.searchExcerpt, 240)}` : "";
-  const topics = item.topics?.length ? ` | topics=${item.topics.map((value) => promptText(value, 100)).join(", ")}` : "";
+  const topics = item.topics?.length ? ` | topics=${item.topics.slice(0, 3).map((value) => promptText(value, 60)).join(", ")}` : "";
   const provenance = item.provenance?.project || item.provenance?.projectId || item.provenance?.containerTag
     ? ` | provenance=${promptText(item.provenance.project || item.provenance.projectId || item.provenance.containerTag, 160)}${item.provenance.project && item.provenance.projectId ? ` (${promptText(item.provenance.projectId, 160)})` : ""}`
     : "";

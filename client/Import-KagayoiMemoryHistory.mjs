@@ -16,6 +16,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import { buildMemoryIndex } from "./memory-index.mjs";
+import { truncateUtf16 } from "./unicode-text.mjs";
 
 const IMPORT_VERSION = 2;
 const DEFAULT_MAX_DOCUMENT_CHARS = 120_000;
@@ -248,7 +249,9 @@ async function readSessionMeta(filePath) {
     }
   } finally {
     lines.close();
+    const closed = input.closed ? null : new Promise((done) => input.once("close", done));
     input.destroy();
+    if (closed) await closed;
   }
   return null;
 }
@@ -270,7 +273,7 @@ function sanitizeText(value, knownSecrets, counter) {
     .trim();
 
   for (const secret of knownSecrets) {
-    if (secret.length >= 6 && text.includes(secret)) {
+    if (secret.length > 0 && text.includes(secret)) {
       text = text.split(secret).join(REDACTED);
       counter.count += 1;
     }
@@ -283,11 +286,25 @@ function sanitizeText(value, knownSecrets, counter) {
     counter,
   );
   text = replaceWithCount(text, /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, "Bearer [REDACTED]", counter);
-  text = replaceWithCount(
-    text,
-    /\b(api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|authorization|auth[_-]?token|client[_-]?secret|secret|password|private[_-]?key|token)\b(\s*[:=]\s*)(["']?)([^\s,"'`}\]\)]+)\3/gi,
-    (_match, name, separator) => `${name}${separator}${REDACTED}`,
-    counter,
+  // 秘密の代入だけを消費し、長い接頭辞の途中から繰り返し探索しない。
+  const secretName = /(?:[a-z0-9]+[_-])*(?:api[_-]?key|api[_-]?token|access[_-]?key|access[_-]?token|refresh[_-]?token|authorization|auth[_-]?token|client[_-]?secret|secret|password|private[_-]?key|token)/.source;
+  const quotedValue = /(?:"((?:\\[\s\S]|[^"\\])*)"|'((?:\\[\s\S]|''|[^'\\])*)'|(\[REDACTED\]|[^\s,"'`}\]\)]+))/.source;
+  const shellValue = /(?:"((?:\\[\s\S]|\x60[\s\S]|[^"\\\x60])*)"|'((?:\\[\s\S]|''|[^'\\])*)'|(\[REDACTED\]|[^\s,"'`}\]\)]+))/.source;
+  // backtick escapeは明示されたPowerShell環境変数だけ。JSONや通常記述では通常文字。
+  const assignments = [
+    [String.raw`(?<![\w-])(["'])(${secretName})\1`, quotedValue],
+    [String.raw`(?<![\w"'-])(?<!\$env:)()(${secretName})`, quotedValue],
+    [String.raw`(?<=\$env:)()(${secretName})`, shellValue],
+  ];
+  for (const [prefix, valuePattern] of assignments) text = text.replace(
+    new RegExp(`${prefix}(\\s*[:=]\\s*)${valuePattern}`, "gi"),
+    (match, nameQuote, name, separator, doubleQuoted, singleQuoted, unquoted) => {
+      const valueQuote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : "";
+      const value = doubleQuoted ?? singleQuoted ?? unquoted;
+      if (value === REDACTED) return match;
+      counter.count += 1;
+      return `${nameQuote}${name}${nameQuote}${separator}${valueQuote}${REDACTED}${valueQuote}`;
+    },
   );
   text = replaceWithCount(
     text,
@@ -438,7 +455,9 @@ async function readTaskTitles(codexHome) {
 }
 
 function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars = DEFAULT_MAX_DOCUMENT_CHARS, containerTag) {
-  const safeTitle = sanitizeText(title || transcript.turns[0]?.user.split("\n")[0] || "Codex task", [], { count: 0 }).slice(0, 200);
+  const titleText = sanitizeText(title || transcript.turns[0]?.user.split("\n")[0] || "Codex task", [], { count: 0 });
+  const legacyTitle = titleText.slice(0, 200);
+  const safeTitle = truncateUtf16(titleText, 200);
   const hasProjectProvenance = typeof project.containerTag === "string" && Boolean(project.containerTag.trim());
   const reuseExistingCapture = containerTag === undefined && hasProjectProvenance;
   containerTag ||= DEFAULT_MEMORY_CONTAINER;
@@ -446,14 +465,22 @@ function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars
     const body = `### User request\n${turn.user}\n\n### Final assistant response\n${turn.assistant}`;
     // 本文ハッシュをIDに含め、再送は同じID、別内容は別IDにする。
     const identity = `${candidate.meta.id}:${index + 1}:${sha256(body)}`;
-    const legacyHeader = `# ${safeTitle}\n\nSession: ${candidate.meta.id}\nTurn: ${index + 1}\n\n`;
+    const legacyHeader = `# ${legacyTitle}\n\nSession: ${candidate.meta.id}\nTurn: ${index + 1}\n\n`;
     const size = maxChars - legacyHeader.length - 80;
     if (size < 100) fail("Document size limit is too small.");
     const parts = [];
-    for (let offset = 0; offset < body.length; offset += size) parts.push(body.slice(offset, offset + size));
+    let start = 0;
+    for (let offset = 0; offset < body.length; offset += size) {
+      // 旧固定幅のhash/part数はreceiptとcanonical rowの互換に維持する。
+      // 出力境界だけ最大1 code unit戻し、補助文字を次のpartへ全体で移す。
+      const legacyPart = body.slice(offset, offset + size);
+      const end = truncateUtf16(body, Math.min(offset + size, body.length)).length;
+      parts.push({ content: body.slice(start, end), hash: sha256(legacyPart).slice(0, 16) });
+      start = end;
+    }
     return parts.map((part, partIndex) => ({
-      customId: `codex-turn-v2:${identity}:${partIndex + 1}:${sha256(part).slice(0, 16)}`,
-      content: `# ${safeTitle}\n\n${part}`,
+      customId: `codex-turn-v2:${identity}:${partIndex + 1}:${part.hash}`,
+      content: `# ${safeTitle}\n\n${part.content}`,
       containerTag,
       ...(reuseExistingCapture ? { reuseExistingCapture: true } : {}),
       metadata: {
@@ -464,7 +491,7 @@ function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars
         sm_client: "codex-kagayoi-memory", sessionId: candidate.meta.id,
         rootSessionId: candidate.meta.rootSessionId, sessionKind: candidate.meta.isSubagent ? "subagent" : "root",
         turn: index + 1, part: partIndex + 1, parts: parts.length,
-        captureVersion: 2, captureKey: `${identity}:${partIndex + 1}:${sha256(part).slice(0, 16)}`,
+        captureVersion: 2, captureKey: `${identity}:${partIndex + 1}:${part.hash}`,
         memoryIndex: buildMemoryIndex({
           title: safeTitle,
           request: turn.user,
@@ -479,43 +506,48 @@ function buildTurnDocuments(candidate, transcript, project = {}, title, maxChars
   });
 }
 
-function chooseCandidates(files, rootOnly) {
+async function chooseCandidates(files, rootOnly) {
   const grouped = new Map();
   let eligibleFiles = 0;
-  return Promise.all(files.map(async (filePath) => {
-    const meta = await readSessionMeta(filePath);
-    if (!meta || (rootOnly && meta.isSubagent)) return;
-    const stats = statSync(filePath);
-    eligibleFiles += 1;
-    const candidate = {
-      filePath,
-      meta,
-      size: stats.size,
-      modifiedMs: stats.mtimeMs,
-      recent: Date.now() - stats.mtimeMs < RECENT_TRANSCRIPT_WINDOW_MS,
-    };
-    const existing = grouped.get(meta.id);
-    if (!existing) {
-      grouped.set(meta.id, candidate);
-    } else {
-      const replacement = candidate.size > existing.size || (candidate.size === existing.size && candidate.modifiedMs > existing.modifiedMs)
-        ? candidate
-        : existing;
-      replacement.recent = existing.recent || candidate.recent;
-      grouped.set(meta.id, replacement);
+  // 固定workerだけがstreamを生成する。--limit適用前も全候補を走査する。
+  let next = 0;
+  async function worker() {
+    while (next < files.length) {
+      const filePath = files[next++];
+      const meta = await readSessionMeta(filePath);
+      if (!meta || (rootOnly && meta.isSubagent)) continue;
+      const stats = statSync(filePath);
+      eligibleFiles += 1;
+      const candidate = {
+        filePath,
+        meta,
+        size: stats.size,
+        modifiedMs: stats.mtimeMs,
+        recent: Date.now() - stats.mtimeMs < RECENT_TRANSCRIPT_WINDOW_MS,
+      };
+      const existing = grouped.get(meta.id);
+      if (!existing) {
+        grouped.set(meta.id, candidate);
+      } else {
+        const replacement = candidate.size > existing.size || (candidate.size === existing.size && candidate.modifiedMs > existing.modifiedMs)
+          ? candidate
+          : existing;
+        replacement.recent = existing.recent || candidate.recent;
+        grouped.set(meta.id, replacement);
+      }
     }
-  })).then(() => {
-    const candidates = [...grouped.values()].sort((left, right) => {
-      const leftKey = left.meta.timestamp || "";
-      const rightKey = right.meta.timestamp || "";
-      return leftKey.localeCompare(rightKey) || left.meta.id.localeCompare(right.meta.id);
-    });
-    return {
-      candidates,
-      duplicateFiles: eligibleFiles - candidates.length,
-      recentlyActiveSessions: candidates.filter((candidate) => candidate.recent).length,
-    };
+  }
+  await Promise.all(Array.from({ length: Math.min(8, files.length) }, worker));
+  const candidates = [...grouped.values()].sort((left, right) => {
+    const leftKey = left.meta.timestamp || "";
+    const rightKey = right.meta.timestamp || "";
+    return leftKey.localeCompare(rightKey) || left.meta.id.localeCompare(right.meta.id);
   });
+  return {
+    candidates,
+    duplicateFiles: eligibleFiles - candidates.length,
+    recentlyActiveSessions: candidates.filter((candidate) => candidate.recent).length,
+  };
 }
 
 async function listDocuments(config, containerTag) {
