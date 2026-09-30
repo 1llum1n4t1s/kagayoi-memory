@@ -1,6 +1,6 @@
 {
   "name": "@kagayoi/memory-server",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "deploy": "wrangler deploy --minify",
     "migrate:local": "wrangler d1 migrations apply DB --local",
     "migrate:remote": "wrangler d1 migrations apply DB --remote",
-    "test": "node --experimental-transform-types --test tests/auth.test.mjs tests/topics.test.mjs tests/races.test.mjs && node tests/smoke.mjs",
+    "test": "node --experimental-transform-types --test tests/auth.test.mjs tests/topics.test.mjs tests/races.test.mjs && node --experimental-transform-types tests/log-regressions.mjs && node --experimental-transform-types tests/recall-efficiency.mjs && node tests/smoke.mjs",
     "test:live": "node tests/live-smoke.mjs"
   },
   "devDependencies": {
