@@ -24,7 +24,15 @@ function run(args) {
 async function stopChild(child) {
   if (!child || child.exitCode !== null) return;
   const exited = new Promise((resolvePromise) => child.once("exit", resolvePromise));
-  child.kill();
+  // WindowsではWrangler配下のworkerdも終了し、ローカルD1のロックを解放する。
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+  } else {
+    child.kill();
+  }
   await Promise.race([
     exited,
     new Promise((resolvePromise) => setTimeout(resolvePromise, 2_000)),
@@ -32,7 +40,8 @@ async function stopChild(child) {
 }
 
 async function waitForServer() {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
     try {
       const response = await fetch(`${baseUrl}/health`);
       if (response.ok) return;
@@ -67,7 +76,8 @@ async function callMcp() {
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } })}\n`);
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`);
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "search_memory", arguments: { query: "Cloudflare", containerTag: "repo_test__0123456789abcdef" } } })}\n`);
-  for (let attempt = 0; attempt < 80 && responses.length < 3; attempt += 1) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline && responses.length < 3) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
   }
   await stopChild(child);
