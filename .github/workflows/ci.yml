@@ -53,3 +53,11 @@ jobs:
           name: kagayoi-memory
           path: dist/kagayoi-memory.tar.gz
           if-no-files-found: error
+
+      - name: Upload reproducible validation results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kagayoi-memory-validation
+          path: dist/*validation.json
+          if-no-files-found: warn

@@ -1,6 +1,6 @@
 {
   "name": "kagayoi-memory",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.4.0",
@@ -10,7 +10,7 @@
   "scripts": {
     "test": "pnpm run test:client && pnpm run test:scripts && pnpm run test:server",
     "test:client": "node --test client/*.test.mjs",
-    "test:scripts": "node --test scripts/*.test.mjs",
+    "test:scripts": "node --test scripts/*.test.mjs && node scripts/capture-redaction-e2e.mjs && node scripts/client-repair-e2e.mjs && node scripts/capture-diagnostics-e2e.mjs && node scripts/opop-client-e2e.mjs && node scripts/recall-hook-e2e.mjs",
     "test:server": "pnpm -C server test",
     "validate:plugin": "node scripts/validate-plugin.mjs",
     "package:plugin": "node scripts/package-plugin.mjs && node scripts/validate-plugin.mjs dist/kagayoi-memory",

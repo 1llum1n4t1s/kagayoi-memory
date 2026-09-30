@@ -22,6 +22,11 @@ Run these checks from the repository root for affected changes (Node.js 24.18.0 
 
 ```powershell
 node --test client/*.test.mjs scripts/*.test.mjs
+node scripts/capture-redaction-e2e.mjs
+node scripts/client-repair-e2e.mjs
+node scripts/capture-diagnostics-e2e.mjs
+node scripts/opop-client-e2e.mjs
+node scripts/recall-hook-e2e.mjs
 pnpm -C server install --frozen-lockfile
 pnpm -C server check
 node scripts/validate-plugin.mjs
@@ -31,9 +36,19 @@ git diff --check
 
 Server tests use local D1 and deterministic AI/vector fixtures. Provisioning tests simulate Wrangler calls without creating remote resources. In `server/tests/smoke.mjs`, preserve bounded waits for local Worker startup and MCP responses; on Windows, stop the Wrangler process tree, including `workerd`, before removing temporary D1 state so database locks are released.
 
+`scripts/capture-redaction-e2e.mjs` exercises the real Stop hook against an authenticated loopback API and writes `dist/capture-redaction-after-validation.json`. It verifies secret assignments in captured content and titles, preserved discussion text, deterministic IDs, acknowledged retry suppression, and concurrent Stop receipt integrity. Keep its rendezvous and child-process waits bounded, including the missing-participant canary. It runs with the script checks in CI.
+
+`scripts/client-repair-e2e.mjs` verifies Unicode-safe output with unchanged v2 capture identities and bounded history discovery. `scripts/capture-diagnostics-e2e.mjs` verifies fixed capture failure codes through the hook and standalone CLI without exposing exception text. Both use isolated fixtures, write reproducible results under `dist/`, and run with the script checks. `server/tests/review-fixes-e2e.mjs` verifies atomic source/checkpoint mutations, restore/forget cleanup races, FTS updates, and scoped consolidation queries through the authenticated Worker and migration-backed SQLite. It runs as part of `pnpm -C server check` and writes `dist/server-review-fixes-validation.json`.
+
+`scripts/opop-client-e2e.mjs` checks invalid configuration and stdin roots, legacy settings fallback, partial document-fetch notifications, and event-specific hook imports through actual launcher processes and an authenticated loopback API. Inspect the checks and module-load counts in `dist/opop-client-validation.json`.
+
+`scripts/recall-hook-e2e.mjs` verifies current recall contracts through actual hook subprocesses without depending on Git HEAD. It checks duplicate suppression, revisions, compaction, bounded context, and Git discovery counts, writes `dist/recall-hook-validation.json`, and runs with the script checks. Use `--runtime-root dist/kagayoi-memory` to check the packaged launcher; both subprocess waits and fixture cleanup must remain bounded and portable.
+
 When changing asynchronous enrichment, preserve revision guards and project-scoped fact relationships; validate stale topic/vector work and update/forget races in `server/tests/races.test.mjs`, plus the API coverage in `server/tests/smoke.mjs`. Vector changes must also cover bounded Vectorize lookups, forgotten-vector cleanup even when AI enrichment is disabled, and repair after late upserts or deletion races. Topic API changes must retain unclassified browsing and exact-topic filtering across legacy and shared spaces.
 
 For recall changes, validate the [recall contracts](DESIGN.md#recall) through `server/tests/recall-efficiency.mjs`, which connects the real client and authenticated Worker API to migration-backed SQLite with deterministic AI/vector fixtures. Retain coverage for request/embedding/vector counts across many spaces, scoped searches, failure fallback, legacy indexes, source excerpts, and checkpoint selection. Inspect its reproducible metrics and results in `dist/recall-efficiency-validation.json`.
+
+`server/tests/opop-performance.mjs` compares current and former display projections and ranking through authenticated Worker APIs on migration-backed SQLite. It verifies identical public JSON, stable ties, checkpoint selection, scopes, and retained semantic embeddings, and measures actual D1 row bytes and bounded ranking computation. It runs with server checks and writes `dist/opop-performance-validation.json`; its synthetic CPU timings do not measure deployed API latency.
 
 Consolidation changes must preserve the [project consolidation contracts](DESIGN.md#project-consolidation). Cover them in `client/mcp-server.test.mjs`, `server/tests/races.test.mjs`, and the authenticated API path in `server/tests/smoke.mjs`. Validate truncated-output retry, publication races, stale checkpoint recovery, and enrichment/scheduled failure diagnostics in `server/tests/log-regressions.mjs`; inspect `dist/server-log-validation.json`. Both artifact-producing checks run as part of `pnpm -C server check`. Preserve both cron definitions in `server/wrangler.example.jsonc`, and apply migration `0005_memory_consolidations.sql` before installing a client that depends on consolidation.
 
