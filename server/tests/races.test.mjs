@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
@@ -73,13 +73,8 @@ function d1Adapter(database) {
 function openDatabase() {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA foreign_keys = ON");
-  for (const name of [
-    "0001_initial.sql",
-    "0002_semantic_graph.sql",
-    "0003_vector_resilience.sql",
-    "0004_content_topics.sql",
-    "0005_memory_consolidations.sql",
-  ]) {
+  const migrations = resolve(import.meta.dirname, "..", "migrations");
+  for (const name of readdirSync(migrations).filter((name) => name.endsWith(".sql")).sort()) {
     database.exec(readFileSync(resolve(import.meta.dirname, "..", "migrations", name), "utf8"));
   }
   return database;

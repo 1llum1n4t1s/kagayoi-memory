@@ -1,7 +1,8 @@
 // 実行: node --experimental-transform-types server/tests/recall-efficiency.mjs
 // 失敗条件: 領域数に比例する通信/AI呼出、100領域上限、scope漏れ、障害時の検索消失、
 // stale vector混入、原文固有語欠落/semantic自動注入、legacy出典破壊、checkpoint過剰抑制、
-// 互換fallback誤判定、空prompt通信。実APIと実clientを全migration済みSQLiteへ接続する。
+// 互換fallback誤判定、空prompt通信、パス内のプロジェクト欠落、識別子の見出し不一致、
+// バージョン番号の過剰除外。実APIと実clientを全migration済みSQLiteへ接続する。
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -145,6 +146,63 @@ const cases = [];
 const scenario = (name, run) => cases.push({ name, run });
 const ids = (result) => result.results.map((row) => row.id);
 const index = (title, request = title) => ({ memoryIndex: buildMemoryIndex({ title, request, sourceUpdatedAt: sourceDate }) });
+
+scenario("automatic project-path recall excludes machine prefixes and generic request noise", async (f) => {
+  const wanted = await f.seed("other-folder", "# Kagayoi Memory\n索引の読込", index("Kagayoi Memory", "索引の読込"));
+  const noise = [];
+  for (const [title, request] of [["Kagayoi.Support", String.raw`C:\Users\IMT\dev\Kagayoi.Support`], ["請求書", "修正してください"], ["Release", "Developer release"]]) {
+    noise.push(await f.seed("unrelated-folder", `# ${title}\n${request}`, index(title, request)));
+  }
+  f.reset(); const hook = await f.hook(String.raw`"C:\Users\IMT\dev\kagayoi-memory" メモリー機能側で修正で最適化が出来そうな部分が発見できていたら修正してください`);
+  const text = hook.hookSpecificOutput?.additionalContext || "";
+  assert.ok(text.includes(wanted)); assert.ok(noise.every((id) => !text.includes(id)));
+  assert.equal(f.metrics.requests.length, 1);
+  assert.doesNotMatch(f.metrics.requests[0].body.q, /Users|IMT|\bdev\b/u);
+  return { selected: 1, excluded: noise.length, requests: f.metrics.requests.length, crossFolderMatch: true };
+});
+scenario("ASCII word fragments stay out of automatic recall while manual semantic search remains", async (f) => {
+  const wanted = await f.seed("development", "# Dev tools\nDevelopment tools", index("Dev tools"));
+  const unrelated = await f.seed("release", "# Developer release\nRelease history", index("Developer release"));
+  f.reset(); const result = await f.search("dev", { automatic: true });
+  assert.ok(ids(result).includes(wanted)); assert.ok(!ids(result).includes(unrelated));
+  f.reset(); assert.ok(ids(await f.search("dev")).includes(unrelated));
+  const dotnet = await f.seed("dotnet", "# .NET8 runtime\nRuntime behavior", index(".NET8 runtime"));
+  const node = await f.seed("node", "# Node.js24 runtime\nRuntime behavior", index("Node.js24 runtime"));
+  const wrongVersion = await f.seed("other-version", "# .NET80 runtime\nDifferent version", index(".NET80 runtime"));
+  f.reset(); assert.ok(ids(await f.search(".NET", { automatic: true })).includes(dotnet));
+  f.reset(); assert.ok(ids(await f.search("Node.js", { automatic: true })).includes(node));
+  f.reset(); const versioned = await f.search(".NET8", { automatic: true });
+  assert.ok(ids(versioned).includes(dotnet)); assert.ok(!ids(versioned).includes(wrongVersion));
+});
+scenario("file paths preserve the project without recalling another project README", async (f) => {
+  const wanted = await f.seed("other-folder", "# Kagayoi Memory\n索引の読込", index("Kagayoi Memory", "索引の読込"));
+  const unrelated = await f.seed("other-project", "# README.md\nDocumentation changes", index("README.md"));
+  f.reset(); const result = await f.hook(String.raw`"C:\Users\IMT\dev\kagayoi-memory\client\memory-client.mjs" を修正してください`);
+  const text = result.hookSpecificOutput?.additionalContext || "";
+  assert.ok(text.includes(wanted)); assert.ok(!text.includes(unrelated));
+  assert.match(f.metrics.requests[0].body.q, /kagayoi-memory/u);
+  assert.doesNotMatch(f.metrics.requests[0].body.q, /Users|IMT|\bdev\b|memory-client/u);
+  const support = await f.seed("support-folder", "# Kagayoi.Support\nSupport service", index("Kagayoi.Support"));
+  const code = await f.seed("code-folder", "# Code\nCode samples", index("Code"));
+  for (const query of [String.raw`"C:\Code\Kagayoi.Support"`, String.raw`"C:\Code\Kagayoi.Support\"`, '"/opt/Kagayoi.Support"']) {
+    f.reset(); const result = await f.search(query, { automatic: true });
+    assert.ok(ids(result).includes(support)); assert.ok(!ids(result).includes(code));
+  }
+});
+scenario("legacy hydration uses the same identifier matching for the selected heading", async (f) => {
+  const wanted = await f.seed("legacy", "## Gardening\nFlower care\n\n## Kagayoi Memory\n索引の読込", { sm_project_id: "legacy-source", sourceTimestamp: sourceDate });
+  f.legacy(); f.reset(); const result = await f.search("kagayoi-memory", { automatic: true });
+  const row = result.results.find((candidate) => candidate.id === wanted);
+  assert.ok(row); assert.equal(row.title, "Kagayoi Memory"); assert.doesNotMatch(row.description, /Flower/u);
+  assert.equal(row.provenance.projectId, "legacy-source"); assert.equal(row.sourceUpdatedAt, sourceDate);
+  assert.ok(f.metrics.requests.some((request) => request.path === `/v3/documents/${wanted}`));
+});
+scenario("generic repair wording skips automatic requests but remains manually searchable", async (f) => {
+  const wanted = await f.seed("manual-history", "# 最適化の記録\n修正内容", index("最適化の記録"));
+  f.reset(); assert.deepEqual(await f.hook("修正して最適化してください"), {});
+  assert.equal(f.metrics.requests.length, 0); assert.equal(f.metrics.embeddings, 0);
+  f.reset(); assert.ok(ids(await f.search("最適化")).includes(wanted));
+});
 
 scenario("59 legacy spaces: search, hook and MCP each use one API/embed/vector and zero document GET", async (f) => {
   const wanted = await f.seed("space-58", "# AbortSignal timeout\n\nAbortSignal timeout implementation evidence", { sm_project_id: "legacy-project", sourceTimestamp: sourceDate });

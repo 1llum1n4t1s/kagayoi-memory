@@ -59,6 +59,14 @@ type MemoryRow = {
   updated_at: string;
 };
 
+// 表示APIはベクトル値を公開しない。状態・モデル・日時は従来どおり取得する。
+const DOCUMENT_DISPLAY_COLUMNS = `m.id, m.custom_id, m.container_tag, m.content, m.metadata_json, m.entity_context,
+  m.status, m.is_forgotten, m.embedding_status, m.fact_status, m.embedding_model,
+  m.fact_model, m.embedded_at, m.facts_extracted_at, m.enrichment_error,
+  m.topic_status, m.topic_model, m.topics_extracted_at, m.topic_revision,
+  NULL AS embedding_json, m.vector_status, m.vector_mutation_id, m.vector_attempted_at,
+  m.created_at, m.updated_at`;
+
 type RankedMemoryRow = Pick<
   MemoryRow,
   "id" | "container_tag" | "content" | "metadata_json" | "created_at" | "updated_at"
@@ -316,10 +324,17 @@ function clampConfidence(value: unknown): number {
     : 0.5;
 }
 
+// UTF-16の上限は維持し、切断位置がサロゲートペアの途中なら一文字手前にする。
+function truncateUtf16(value: string, maxLength: number): string {
+  let end = Math.min(value.length, Math.max(0, Math.floor(maxLength)));
+  if (end > 0 && end < value.length && /[\uD800-\uDBFF]/u.test(value[end - 1]!) && /[\uDC00-\uDFFF]/u.test(value[end]!)) end -= 1;
+  return value.slice(0, end);
+}
+
 function cleanFactPart(value: unknown, maxLength: number): string | null {
   if (typeof value !== "string") return null;
   const clean = value.normalize("NFKC").trim().replace(/\s+/gu, " ");
-  return clean.length > 0 ? clean.slice(0, maxLength) : null;
+  return clean.length > 0 ? truncateUtf16(clean, maxLength) : null;
 }
 
 function normalizeTopic(value: unknown): string | null {
@@ -539,10 +554,11 @@ function excerpt(content: string, query: string, maxLength: number): string {
   if (content.length <= maxLength) return content;
   const firstTerm = (query.match(/[\p{L}\p{N}_-]{3,}/u) ?? [""])[0]?.toLocaleLowerCase() ?? "";
   const matchAt = firstTerm ? content.toLocaleLowerCase().indexOf(firstTerm) : -1;
-  const start = Math.max(0, (matchAt >= 0 ? matchAt : 0) - Math.floor(maxLength / 3));
+  let start = Math.max(0, (matchAt >= 0 ? matchAt : 0) - Math.floor(maxLength / 3));
+  if (start > 0 && /[\uD800-\uDBFF]/u.test(content[start - 1]!) && /[\uDC00-\uDFFF]/u.test(content[start]!)) start += 1;
   const prefix = start > 0 ? "…" : "";
   const suffix = start + maxLength < content.length ? "…" : "";
-  return `${prefix}${content.slice(start, start + maxLength)}${suffix}`;
+  return `${prefix}${truncateUtf16(content.slice(start), maxLength)}${suffix}`;
 }
 
 function provenance(row: Pick<MemoryRow, "container_tag">, metadata: JsonObject): JsonObject {
@@ -631,7 +647,7 @@ function memoryResult(
 
 async function embedText(text: string, env: Env): Promise<number[]> {
   const output = await env.AI.run(EMBEDDING_MODEL, {
-    text: [text.slice(0, MAX_EMBEDDING_CONTENT_LENGTH)],
+    text: [truncateUtf16(text, MAX_EMBEDDING_CONTENT_LENGTH)],
     truncate_inputs: true,
   });
   if (!("data" in output) || !Array.isArray(output.data) || !Array.isArray(output.data[0])) {
@@ -655,7 +671,7 @@ async function extractEnrichment(content: string, env: Env): Promise<ExtractedEn
           "Use concise subject, predicate, and object strings in the source language. Set exclusive=true only when a predicate can have one current value, such as a chosen backend, current location, current version, or status. " +
           "Also return 1 to 5 short content-topic labels in the source language. Topics describe the subject matter, such as Cloudflare D1 or TypeScript. Never use source folders, project/container tags, session or thread identifiers, file paths, UUIDs, or hashes as topics.",
       },
-      { role: "user", content: content.slice(0, MAX_FACT_CONTENT_LENGTH) },
+      { role: "user", content: truncateUtf16(content, MAX_FACT_CONTENT_LENGTH) },
     ],
     response_format: {
       type: "json_schema",
@@ -738,7 +754,7 @@ export function parseEnrichmentPayload(contentJson: string): ExtractedEnrichment
 function cleanConsolidationText(value: unknown, maxLength: number): string | null {
   if (typeof value !== "string") return null;
   const clean = value.normalize("NFKC").trim().replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "");
-  return clean.length > 0 ? clean.slice(0, maxLength) : null;
+  return clean.length > 0 ? truncateUtf16(clean, maxLength) : null;
 }
 
 function consolidationList(value: unknown): string[] {
@@ -773,14 +789,14 @@ export function parseConsolidationPayload(contentJson: string): ConsolidationPay
 function renderConsolidation(payload: ConsolidationPayload): string {
   const section = (heading: string, items: string[]) =>
     `## ${heading}\n\n${items.length > 0 ? items.map((item) => `- ${item}`).join("\n") : "- なし"}`;
-  return [
+  return truncateUtf16([
     `# ${payload.title}`,
     payload.overview,
     section("検証済み", payload.verified),
     section("未検証", payload.unverified),
     section("未解決", payload.unresolved),
     section("次の手", payload.nextActions),
-  ].join("\n\n").slice(0, MAX_CONTENT_LENGTH);
+  ].join("\n\n"), MAX_CONTENT_LENGTH);
 }
 
 async function extractConsolidation(
@@ -788,7 +804,7 @@ async function extractConsolidation(
   sources: ConsolidationSource[],
   env: Env,
 ): Promise<ConsolidationPayload> {
-  const baseline = previousSummary ? previousSummary.slice(0, 20_000) : null;
+  const baseline = previousSummary ? truncateUtf16(previousSummary, 20_000) : null;
   const overhead = 250;
   const available = Math.max(1_000, MAX_CONSOLIDATION_INPUT_LENGTH - (baseline?.length ?? 0));
   const perSource = Math.max(500, Math.min(5_000, Math.floor(available / Math.max(1, sources.length)) - overhead));
@@ -796,7 +812,7 @@ async function extractConsolidation(
     id: source.id,
     containerTag: source.containerTag,
     createdAt: source.createdAt,
-    content: source.content.slice(0, perSource),
+    content: truncateUtf16(source.content, perSource),
   }));
   // 通常の出力も予算内に抑え、切断・不正JSON時だけ同じ入力で短い出力を一度再生成する。
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -874,7 +890,7 @@ const CONSOLIDATION_PROJECT_KEY_SQL = `CASE
   ELSE 'container:' || m.container_tag
 END`;
 
-async function consolidationTargets(env: Env, now: Date): Promise<ConsolidationTarget[]> {
+async function consolidationTargets(env: Env, now: Date, projectKey?: string): Promise<ConsolidationTarget[]> {
   const result = await env.DB.prepare(
     `WITH raw AS (
        SELECT m.id, m.container_tag, m.created_at,
@@ -886,6 +902,7 @@ async function consolidationTargets(env: Env, now: Date): Promise<ConsolidationT
        FROM memories AS m
        WHERE m.is_forgotten = 0
          AND json_extract(m.metadata_json, '$.sm_consolidation') IS NOT 1
+         ${projectKey === undefined ? "" : `AND ${CONSOLIDATION_PROJECT_KEY_SQL} = ?`}
      ), unconsolidated AS (
        SELECT raw.* FROM raw
        WHERE NOT EXISTS (
@@ -904,7 +921,7 @@ async function consolidationTargets(env: Env, now: Date): Promise<ConsolidationT
      LEFT JOIN memory_consolidation_projects AS project ON project.project_key = u.project_key
      GROUP BY u.project_key, project.last_success_at, project.initial_backfill_completed
      ORDER BY oldestUnconsolidatedAt ASC`,
-  ).all<ConsolidationTarget>();
+  ).bind(...(projectKey === undefined ? [] : [projectKey])).all<ConsolidationTarget>();
   const cutoff = now.getTime() - CONSOLIDATION_AFTER_MS;
   return result.results.filter((target) => {
     const reference = target.lastSuccessAt ?? target.oldestUnconsolidatedAt;
@@ -924,9 +941,11 @@ async function completeInitialBackfill(projectKey: string, env: Env): Promise<vo
 }
 
 async function unconsolidatedTarget(env: Env, identity: string): Promise<ConsolidationTarget | null> {
-  const all = await consolidationTargets(env, new Date(8_640_000_000_000_000));
-  return all.find((target) => target.projectKey === `project:${identity}`) ??
-    all.find((target) => target.projectKey === `container:${identity}`) ?? null;
+  const now = new Date(8_640_000_000_000_000);
+  const [project] = await consolidationTargets(env, now, `project:${identity}`);
+  if (project) return project;
+  const [legacy] = await consolidationTargets(env, now, `container:${identity}`);
+  return legacy ?? null;
 }
 
 async function acquireConsolidationLease(
@@ -1066,7 +1085,7 @@ async function persistConsolidation(
     ...payload.unverified.map((item) => `未検証: ${item}`),
     ...payload.unresolved.map((item) => `未解決: ${item}`),
     ...payload.nextActions.map((item) => `次の手: ${item}`),
-  ].slice(0, 4).map((item) => item.slice(0, 60));
+  ].slice(0, 4).map((item) => truncateUtf16(item, 60));
   const allSourceContainerTags = [...sourceContainers];
   const storedSourceContainerTags = allSourceContainerTags.slice(-MAX_STORED_CONSOLIDATION_SOURCE_CONTAINERS);
   const metadata: JsonObject = {
@@ -1086,7 +1105,7 @@ async function persistConsolidation(
     memoryIndex: {
       version: 1,
       title: payload.title,
-      description: payload.overview.slice(0, 1_000),
+      description: truncateUtf16(payload.overview, 1_000),
       sections,
       recallable: true,
     },
@@ -1275,7 +1294,7 @@ async function consolidateMemoryProject(
   const target = await unconsolidatedTarget(env, projectId);
   if (!target) return json({ status: "no_unconsolidated_memories", projectId });
   if (body.force !== true) {
-    const due = await consolidationTargets(env, new Date());
+    const due = await consolidationTargets(env, new Date(), target.projectKey);
     if (!due.some((candidate) => candidate.projectKey === target.projectKey)) {
       return json({ status: "not_due", projectId });
     }
@@ -1312,10 +1331,64 @@ async function runScheduledConsolidations(env: Env, ctx: ExecutionContext): Prom
       console.error(JSON.stringify({
         event: target.initialBackfillCompleted !== 1 ? "memory_initial_backfill_failed" : "memory_consolidation_failed",
         projectKey: target.projectKey,
-        error: error instanceof Error ? error.message : String(error),
+        error: diagnosticError(error, env),
       }));
     }
   }
+}
+
+// 呼出元の新しい版を選ぶSQLを無効化条件へ組み込み、原文変更と同じbatchで確定する。
+function dependentConsolidationStatements(
+  env: Env,
+  sourceSql: string,
+  sourceValues: unknown[],
+  now: string,
+): D1PreparedStatement[] {
+  const dependency = `(consolidation.memory_id IN (${sourceSql}) OR EXISTS (
+    SELECT 1 FROM memory_consolidation_sources AS source
+    WHERE source.consolidation_id = consolidation.id AND source.memory_id IN (${sourceSql})
+  ))`;
+  const values = [...sourceValues, ...sourceValues];
+  const activeIds = `SELECT consolidation.id FROM memory_consolidations AS consolidation
+    WHERE consolidation.status = 'active' AND ${dependency}`;
+  const activeMemories = `SELECT consolidation.memory_id FROM memory_consolidations AS consolidation
+    WHERE consolidation.status = 'active' AND ${dependency}`;
+  return [
+    env.DB.prepare(
+      `UPDATE memory_consolidation_projects SET active_consolidation_id = NULL, updated_at = ?
+       WHERE active_consolidation_id IN (${activeIds})`,
+    ).bind(now, ...values),
+    env.DB.prepare(`DELETE FROM facts WHERE source_memory_id IN (${activeMemories})`).bind(...values),
+    env.DB.prepare(`DELETE FROM memory_topics WHERE memory_id IN (${activeMemories})`).bind(...values),
+    env.DB.prepare(
+      `UPDATE memories SET status = 'superseded', is_forgotten = 1, vector_status = 'pending',
+         vector_mutation_id = NULL, vector_attempted_at = NULL, updated_at = ?
+       WHERE id IN (${activeMemories})`,
+    ).bind(now, ...values),
+    env.DB.prepare(
+      `UPDATE memory_consolidations AS consolidation SET status = 'invalid', updated_at = ?
+       WHERE consolidation.status = 'active' AND ${dependency}`,
+    ).bind(now, ...values),
+  ];
+}
+
+async function cleanupInvalidatedConsolidations(
+  sourceMemoryId: string,
+  now: string,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<void> {
+  const invalidated = await env.DB.prepare(
+    `SELECT consolidation.memory_id AS memoryId, memory.container_tag AS containerTag
+     FROM memory_consolidations AS consolidation
+     JOIN memories AS memory ON memory.id = consolidation.memory_id
+     WHERE consolidation.status = 'invalid' AND consolidation.updated_at = ?
+       AND (consolidation.memory_id = ? OR EXISTS (
+         SELECT 1 FROM memory_consolidation_sources AS source
+         WHERE source.consolidation_id = consolidation.id AND source.memory_id = ?
+       ))`,
+  ).bind(now, sourceMemoryId, sourceMemoryId).all<{ memoryId: string; containerTag: string }>();
+  for (const row of invalidated.results) await removeDerivedMemory(row.memoryId, row.containerTag, env, ctx);
 }
 
 async function invalidateDependentConsolidations(
@@ -1323,37 +1396,9 @@ async function invalidateDependentConsolidations(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<void> {
-  const active = await env.DB.prepare(
-    `SELECT DISTINCT consolidation.id, consolidation.memory_id AS memoryId, memory.container_tag AS containerTag
-     FROM memory_consolidations AS consolidation
-     JOIN memories AS memory ON memory.id = consolidation.memory_id
-     LEFT JOIN memory_consolidation_sources AS source ON source.consolidation_id = consolidation.id
-     WHERE consolidation.status = 'active'
-       AND (source.memory_id = ? OR consolidation.memory_id = ?)`,
-  ).bind(sourceMemoryId, sourceMemoryId).all<{ id: string; memoryId: string; containerTag: string }>();
-  if (active.results.length === 0) return;
   const now = new Date().toISOString();
-  const ids = active.results.map((row) => row.id);
-  const placeholders = ids.map(() => "?").join(", ");
-  await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE memory_consolidation_projects SET active_consolidation_id = NULL, updated_at = ?
-       WHERE active_consolidation_id IN (${placeholders})`,
-    ).bind(now, ...ids),
-    env.DB.prepare(
-      `UPDATE memories
-       SET status = 'superseded', is_forgotten = 1, vector_status = 'pending',
-           vector_mutation_id = NULL, vector_attempted_at = NULL, updated_at = ?
-       WHERE id IN (SELECT memory_id FROM memory_consolidations WHERE id IN (${placeholders}))`,
-    ).bind(now, ...ids),
-    env.DB.prepare(
-      `UPDATE memory_consolidations SET status = 'invalid', updated_at = ?
-       WHERE id IN (${placeholders}) AND status = 'active'`,
-    ).bind(now, ...ids),
-  ]);
-  for (const row of active.results) {
-    await removeDerivedMemory(row.memoryId, row.containerTag, env, ctx);
-  }
+  await env.DB.batch(dependentConsolidationStatements(env, "SELECT ?", [sourceMemoryId], now));
+  await cleanupInvalidatedConsolidations(sourceMemoryId, now, env, ctx);
 }
 
 async function hardDeleteMemory(id: string, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -1404,16 +1449,21 @@ async function hardDeleteMemory(id: string, env: Env, ctx: ExecutionContext): Pr
   ]);
   if ((results[5]?.meta.changes ?? 0) === 0) throw new HttpError(404, "Document not found");
   const invalidated = await env.DB.prepare(
-    `SELECT memory_id AS memoryId FROM memory_consolidations
-     WHERE status = 'invalid' AND updated_at = ?`,
-  ).bind(now).all<{ memoryId: string }>();
-  await restoreUnsupportedFacts(env, current.container_tag);
+    `SELECT consolidation.memory_id AS memoryId, memory.container_tag AS containerTag
+     FROM memory_consolidations AS consolidation
+     JOIN memories AS memory ON memory.id = consolidation.memory_id
+     WHERE consolidation.status = 'invalid' AND consolidation.updated_at = ?`,
+  ).bind(now).all<{ memoryId: string; containerTag: string }>();
+  // 旧checkpointの事実が別コンテナの原文を抑制していた状態も復帰する。
+  for (const containerTag of new Set([current.container_tag, ...invalidated.results.map((row) => row.containerTag)])) {
+    await restoreUnsupportedFacts(env, containerTag);
+  }
   const vectorIds = [...new Set([id, ...invalidated.results.map((row) => row.memoryId)])];
   ctx.waitUntil(
     Promise.resolve()
       .then(() => env.MEMORY_VECTORS.deleteByIds(vectorIds))
       .catch((error) => {
-        console.error(JSON.stringify({ event: "vector_delete_failed", memoryIds: vectorIds, error: String(error) }));
+        console.error(JSON.stringify({ event: "vector_delete_failed", memoryIds: vectorIds, error: diagnosticError(error, env) }));
       }),
   );
   return new Response(null, { status: 204 });
@@ -1668,7 +1718,7 @@ async function enrichMemory(memory: EnrichmentMemory, env: Env): Promise<void> {
 function diagnosticError(error: unknown, env: Env): string {
   const message = error instanceof Error ? error.message : String(error);
   const secret = env.MEMORY_API_KEY;
-  return (secret ? message.replaceAll(secret, "[redacted]") : message).slice(0, 2_000);
+  return truncateUtf16(secret ? message.replaceAll(secret, "[redacted]") : message, 2_000);
 }
 
 async function runMemoryEnrichment(memory: EnrichmentMemory, env: Env): Promise<void> {
@@ -1808,7 +1858,7 @@ async function runMemoryEnrichment(memory: EnrichmentMemory, env: Env): Promise<
     "UPDATE memories SET enrichment_error = ? WHERE id = ? AND updated_at = ? AND topic_revision = ?",
   )
     .bind(
-      errors.length > 0 ? errors.join("; ").slice(0, 2_000) : null,
+      errors.length > 0 ? truncateUtf16(errors.join("; "), 2_000) : null,
       memory.id,
       memory.updatedAt,
       memory.topicRevision,
@@ -1956,7 +2006,7 @@ async function lexicalMemories(
         normalizedFtsRows = result.results;
       }
     } catch (error) {
-      console.error(JSON.stringify({ event: "fts_search_failed", error: String(error) }));
+      console.error(JSON.stringify({ event: "fts_search_failed", error: diagnosticError(error, env) }));
     }
   }
 
@@ -2000,7 +2050,7 @@ async function semanticMemories(
         returnValues: false,
       }).catch((error) => {
         vectorQueryFailed = true;
-        console.error(JSON.stringify({ event: "vector_query_failed", error: String(error) }));
+        console.error(JSON.stringify({ event: "vector_query_failed", error: diagnosticError(error, env) }));
         return { matches: [], count: 0 } satisfies VectorizeMatches;
       }),
       env.DB.prepare(
@@ -2015,7 +2065,7 @@ async function semanticMemories(
         .all<RankedMemoryRow>()
         .then((result) => result.results)
         .catch((error) => {
-          console.error(JSON.stringify({ event: "semantic_fallback_failed", error: String(error) }));
+          console.error(JSON.stringify({ event: "semantic_fallback_failed", error: diagnosticError(error, env) }));
           return [] as RankedMemoryRow[];
         }),
     ]);
@@ -2035,7 +2085,7 @@ async function semanticMemories(
         .then((result) => result.results)
         .catch((error) => {
           fullFallbackFailed = true;
-          console.error(JSON.stringify({ event: "semantic_fallback_failed", error: String(error) }));
+          console.error(JSON.stringify({ event: "semantic_fallback_failed", error: diagnosticError(error, env) }));
           return [] as RankedMemoryRow[];
         });
       if (!fullFallbackFailed) fallbackRows = fullFallbackRows;
@@ -2067,7 +2117,7 @@ async function semanticMemories(
           .all<RankedMemoryRow>();
         for (const row of result.results) vectorRows.set(row.id, row);
       } catch (error) {
-        console.error(JSON.stringify({ event: "vector_hit_hydration_failed", error: String(error) }));
+        console.error(JSON.stringify({ event: "vector_hit_hydration_failed", error: diagnosticError(error, env) }));
       }
     }
 
@@ -2087,7 +2137,7 @@ async function semanticMemories(
       .sort((left, right) => (right.semanticScore ?? -1) - (left.semanticScore ?? -1))
       .slice(0, candidateLimit);
   } catch (error) {
-    console.error(JSON.stringify({ event: "semantic_search_failed", error: String(error) }));
+    console.error(JSON.stringify({ event: "semantic_search_failed", error: diagnosticError(error, env) }));
     return [];
   }
 }
@@ -2127,8 +2177,9 @@ function querySearchExcerpt(content: string, terms: string[]): string {
   for (const term of terms) {
     const at = lower.indexOf(term);
     if (at < 0) continue;
-    const start = Math.max(0, at - 60);
-    const text = content.slice(start, start + 236);
+    let start = Math.max(0, at - 60);
+    if (start > 0 && /[\uD800-\uDBFF]/u.test(content[start - 1]!) && /[\uDC00-\uDFFF]/u.test(content[start]!)) start += 1;
+    const text = truncateUtf16(content.slice(start), 236);
     const score = terms.reduce((sum, value) => sum + (text.toLowerCase().includes(value) ? Math.min(12, value.length) : 0), 0);
     if (score > bestScore) {
       bestScore = score;
@@ -2181,13 +2232,29 @@ function queryCoverage(row: RankedMemoryRow, topics: string[], terms: string[], 
   return terms.reduce((sum, term) => sum + (text.includes(term) ? Math.min(12, term.length) : 0), 0);
 }
 
+function sortByQueryCoverage(
+  rows: RankedMemoryRow[], topics: Map<string, string[]>, terms: string[],
+  compareIndexCoverage = false, preferCheckpoints = false,
+): RankedMemoryRow[] {
+  // 各段階の最新rowから一度だけ算出し、同じIDを持つ別rowも個別に扱う。
+  const ranked = rows.map((row) => ({
+    row,
+    coverage: queryCoverage(row, topics.get(row.id) ?? [], terms),
+    indexCoverage: compareIndexCoverage ? queryCoverage(row, topics.get(row.id) ?? [], terms, false) : 0,
+    checkpoint: preferCheckpoints ? Number(parseMetadata(row.metadata_json).sm_consolidation === true) : 0,
+  }));
+  ranked.sort((left, right) => right.coverage - left.coverage ||
+    right.indexCoverage - left.indexCoverage || right.checkpoint - left.checkpoint);
+  return ranked.map(({ row }) => row);
+}
+
 async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & { results: JsonObject[]; timing: number }> {
   const startedAt = performance.now();
   if (body.indexOnly !== undefined && typeof body.indexOnly !== "boolean") {
     throw new HttpError(400, "indexOnly must be a boolean");
   }
   const indexOnly = body.indexOnly === true;
-  const query = typeof body.q === "string" ? body.q.trim().slice(0, 1_000) : "";
+  const query = typeof body.q === "string" ? truncateUtf16(body.q.trim(), 1_000) : "";
   if (body.allContainers !== undefined && typeof body.allContainers !== "boolean") {
     throw new HttpError(400, "allContainers must be a boolean");
   }
@@ -2227,16 +2294,14 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
     const relevant = query ? await filterIndexLexicalRows(active.results, query, env) : active.results;
     const activeTopics = await topicsByMemory(relevant, env);
     const terms = searchQueryTerms(query);
-    relevant.sort((left, right) => queryCoverage(right, activeTopics.get(right.id) ?? [], terms) - queryCoverage(left, activeTopics.get(left.id) ?? [], terms));
+    const sortedRelevant = sortByQueryCoverage(relevant, activeTopics, terms);
     const candidates = new Map(rows.map((row) => [row.id, row]));
-    for (const row of relevant.slice(0, MAX_LIMIT)) if (!candidates.has(row.id)) candidates.set(row.id, row);
+    for (const row of sortedRelevant.slice(0, MAX_LIMIT)) if (!candidates.has(row.id)) candidates.set(row.id, row);
     rows = [...candidates.values()];
 
     rows = await indexSearchRows(rows, query, env);
     const candidateTopics = await topicsByMemory(rows, env);
-    rows.sort((left, right) => queryCoverage(right, candidateTopics.get(right.id) ?? [], terms) - queryCoverage(left, candidateTopics.get(left.id) ?? [], terms) ||
-      queryCoverage(right, candidateTopics.get(right.id) ?? [], terms, false) - queryCoverage(left, candidateTopics.get(left.id) ?? [], terms, false) ||
-      Number(parseMetadata(right.metadata_json).sm_consolidation === true) - Number(parseMetadata(left.metadata_json).sm_consolidation === true));
+    rows = sortByQueryCoverage(rows, candidateTopics, terms, true, true);
     rows = rows.slice(0, limit);
     if (rows.length > 0) {
       const placeholders = rows.map(() => "?").join(", ");
@@ -2271,8 +2336,7 @@ async function searchMemories(body: JsonObject, env: Env): Promise<JsonObject & 
     rows = await indexSearchRows(rows, query, env, false);
     const candidateTopics = await topicsByMemory(rows, env);
     const terms = searchQueryTerms(query);
-    rows.sort((left, right) => queryCoverage(right, candidateTopics.get(right.id) ?? [], terms) - queryCoverage(left, candidateTopics.get(left.id) ?? [], terms) ||
-      queryCoverage(right, candidateTopics.get(right.id) ?? [], terms, false) - queryCoverage(left, candidateTopics.get(left.id) ?? [], terms, false));
+    rows = sortByQueryCoverage(rows, candidateTopics, terms, true);
     rows = rows.slice(0, limit);
   }
   const topics = await topicsByMemory(rows, env);
@@ -2336,6 +2400,13 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
   }
   const generatedId = crypto.randomUUID();
   const customId = requestedCustomId ?? generatedId;
+  if (requestedCustomId && await env.DB.prepare(
+    `SELECT consolidation.id FROM memory_consolidations AS consolidation
+     JOIN memories AS memory ON memory.id = consolidation.memory_id
+     WHERE memory.container_tag = ? AND memory.custom_id = ?`,
+  ).bind(containerTag, customId).first()) {
+    throw new HttpError(409, "Generated checkpoints cannot be edited; update their source documents instead");
+  }
   const entityContext = optionalString(body.entityContext, "entityContext", 32_000) ?? null;
   const now = new Date().toISOString();
   const initialEnrichmentStatus = shouldEnrich ? "pending" : "disabled";
@@ -2345,7 +2416,7 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
     : shouldEnrich ? "pending" : "disabled";
   const topicRevision = crypto.randomUUID();
 
-  await env.DB.batch([
+  const [, memoryWrite] = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO container_tags(tag, name, created_at, updated_at) VALUES (?, ?, ?, ?)
        ON CONFLICT(tag) DO UPDATE SET updated_at = excluded.updated_at`,
@@ -2377,7 +2448,10 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
           topic_model = NULL,
           topics_extracted_at = NULL,
          enrichment_error = NULL,
-         updated_at = excluded.updated_at`,
+         updated_at = excluded.updated_at
+       WHERE NOT EXISTS (
+         SELECT 1 FROM memory_consolidations WHERE memory_id = memories.id
+       )`,
     ).bind(
       generatedId,
       customId,
@@ -2417,15 +2491,25 @@ async function addMemory(request: Request, env: Env, ctx: ExecutionContext): Pro
              AND newer.status = 'active' AND source.is_forgotten = 0
          )`,
     ).bind(now, containerTag, containerTag, customId, topicRevision),
+    ...dependentConsolidationStatements(
+      env,
+      "SELECT id FROM memories WHERE container_tag = ? AND custom_id = ? AND topic_revision = ? AND is_forgotten = 0",
+      [containerTag, customId, topicRevision],
+      now,
+    ),
   ]);
 
+  // 事前確認の後に公開されたcheckpointも、同じ書込みSQLの正本条件で拒否する。
+  if ((memoryWrite?.meta.changes ?? 0) === 0) {
+    throw new HttpError(409, "Generated checkpoints cannot be edited; update their source documents instead");
+  }
   const stored = await env.DB.prepare(
     "SELECT id FROM memories WHERE container_tag = ? AND custom_id = ?",
   )
     .bind(containerTag, customId)
     .first<{ id: string }>();
   const memoryId = stored?.id ?? generatedId;
-  await invalidateDependentConsolidations(memoryId, env, ctx);
+  await cleanupInvalidatedConsolidations(memoryId, now, env, ctx);
   const memory: EnrichmentMemory = {
     id: memoryId,
     containerTag,
@@ -2661,7 +2745,7 @@ async function reconcileForgottenVectors(env: Env): Promise<void> {
        SET vector_status = 'pending', vector_attempted_at = ?
        WHERE id = ? AND is_forgotten = 1`,
     ).bind(attemptedAt, id)));
-    console.error(JSON.stringify({ event: "forgotten_vector_lookup_failed", memoryIds: ids, error: String(error) }));
+    console.error(JSON.stringify({ event: "forgotten_vector_lookup_failed", memoryIds: ids, error: diagnosticError(error, env) }));
     return;
   }
 
@@ -2677,7 +2761,7 @@ async function reconcileForgottenVectors(env: Env): Promise<void> {
       console.error(JSON.stringify({
         event: "forgotten_vector_delete_failed",
         memoryIds: [...visibleIds],
-        error: String(error),
+        error: diagnosticError(error, env),
       }));
     }
   }
@@ -2831,13 +2915,13 @@ async function reconcileVectors(env: Env): Promise<void> {
              WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0`,
           ).bind(
             now.toISOString(),
-            `vector index: ${String(error)}`.slice(0, 2_000),
+            diagnosticError(`vector index: ${String(error)}`, env),
             vector.id,
             row.topic_revision,
           ),
         );
       }
-      console.error(JSON.stringify({ event: "vector_reconcile_failed", error: String(error) }));
+      console.error(JSON.stringify({ event: "vector_reconcile_failed", error: diagnosticError(error, env) }));
     }
   }
   if (updates.length > 0) await env.DB.batch(updates);
@@ -2965,12 +3049,7 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
       ? "m.id"
       : projection === "capture"
         ? "m.id, m.metadata_json"
-        : `m.id, m.custom_id, m.container_tag, m.content, m.metadata_json, m.entity_context,
-           m.status, m.is_forgotten, m.embedding_status, m.fact_status, m.embedding_model,
-           m.fact_model, m.embedded_at, m.facts_extracted_at, m.enrichment_error,
-           m.topic_status, m.topic_model, m.topics_extracted_at, m.topic_revision,
-           m.embedding_json, m.vector_status, m.vector_mutation_id, m.vector_attempted_at,
-           m.created_at, m.updated_at`;
+        : DOCUMENT_DISPLAY_COLUMNS;
   const [countResult, rowsResult] = await env.DB.batch([
     env.DB.prepare(`SELECT COUNT(*) AS total FROM memories AS m WHERE ${where}`).bind(...parameters),
     env.DB.prepare(
@@ -3075,7 +3154,7 @@ async function listDocuments(request: Request, env: Env): Promise<Response> {
 }
 
 async function getDocument(id: string, env: Env): Promise<Response> {
-  const row = await env.DB.prepare("SELECT * FROM memories WHERE id = ? AND is_forgotten = 0")
+  const row = await env.DB.prepare(`SELECT ${DOCUMENT_DISPLAY_COLUMNS} FROM memories AS m WHERE m.id = ? AND m.is_forgotten = 0`)
     .bind(id)
     .first<MemoryRow>();
   if (!row) throw new HttpError(404, "Document not found");
@@ -3128,6 +3207,10 @@ async function updateDocument(
     .bind(id)
     .first<MemoryRow>();
   if (!current) throw new HttpError(404, "Document not found");
+  // メタデータの差し替えでも生成物の識別を迂回できないよう正本を照合する。
+  if (await env.DB.prepare("SELECT id FROM memory_consolidations WHERE memory_id = ?").bind(id).first()) {
+    throw new HttpError(409, "Generated checkpoints cannot be edited; update their source documents instead");
+  }
   const updatedAt = new Date().toISOString();
   const topicRevision = crypto.randomUUID();
   const nextContent = content ?? current.content;
@@ -3168,11 +3251,15 @@ async function updateDocument(
          )`,
     ).bind(id, id, topicRevision),
     restoreUnsupportedFactsStatement(env, current.container_tag, { id, topicRevision }),
+    ...dependentConsolidationStatements(
+      env, "SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 0",
+      [id, topicRevision], updatedAt,
+    ),
   ]);
   if (!updateResult || (updateResult.meta.changes ?? 0) === 0) {
     throw new HttpError(409, "Document changed while the update was requested");
   }
-  await invalidateDependentConsolidations(id, env, ctx);
+  await cleanupInvalidatedConsolidations(id, updatedAt, env, ctx);
   const memory: EnrichmentMemory = {
     id,
     containerTag: current.container_tag,
@@ -3203,13 +3290,17 @@ async function removeDerivedMemory(
   ctx: ExecutionContext,
 ): Promise<void> {
   await env.DB.batch([
-    env.DB.prepare("DELETE FROM facts WHERE source_memory_id = ?").bind(id),
-    env.DB.prepare("DELETE FROM memory_topics WHERE memory_id = ?").bind(id),
+    env.DB.prepare(
+      "DELETE FROM facts WHERE source_memory_id = ? AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND is_forgotten = 1)",
+    ).bind(id, id),
+    env.DB.prepare(
+      "DELETE FROM memory_topics WHERE memory_id = ? AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND is_forgotten = 1)",
+    ).bind(id, id),
   ]);
   await restoreUnsupportedFacts(env, containerTag);
   ctx.waitUntil(
     deleteForgottenVector(id, env).catch((error) => {
-      console.error(JSON.stringify({ event: "vector_delete_failed", memoryId: id, error: String(error) }));
+      console.error(JSON.stringify({ event: "vector_delete_failed", memoryId: id, error: diagnosticError(error, env) }));
     }),
   );
 }
@@ -3232,7 +3323,7 @@ async function deleteVectorAfterStaleUpsert(id: string, env: Env): Promise<void>
   try {
     await deleteForgottenVector(id, env);
   } catch (error) {
-    console.error(JSON.stringify({ event: "late_vector_delete_failed", memoryId: id, error: String(error) }));
+    console.error(JSON.stringify({ event: "late_vector_delete_failed", memoryId: id, error: diagnosticError(error, env) }));
   }
 }
 
@@ -3280,8 +3371,8 @@ async function repairActiveVectorAfterDelete(
          SET vector_status = 'failed', vector_mutation_id = NULL, vector_attempted_at = NULL,
              enrichment_error = ?
          WHERE id = ? AND topic_revision IS ? AND is_forgotten = 0`,
-      ).bind(`vector restore after delete: ${String(error)}`.slice(0, 2_000), id, current.topic_revision).run();
-      console.error(JSON.stringify({ event: "vector_restore_after_delete_failed", memoryId: id, error: String(error) }));
+      ).bind(diagnosticError(`vector restore after delete: ${String(error)}`, env), id, current.topic_revision).run();
+      console.error(JSON.stringify({ event: "vector_restore_after_delete_failed", memoryId: id, error: diagnosticError(error, env) }));
       return;
     }
     lastMutation = "upsert";
@@ -3312,25 +3403,33 @@ async function forgetMemory(request: Request, env: Env, ctx: ExecutionContext): 
   if (!content && !documentId) throw new HttpError(400, "content or documentId is required");
   const row = documentId
     ? await env.DB.prepare(
-      `SELECT id FROM memories
+      `SELECT id, topic_revision, updated_at FROM memories
        WHERE container_tag = ? AND id = ? AND is_forgotten = 0
          ${content ? "AND content = ?" : ""}
        LIMIT 1`,
-    ).bind(...(content ? [containerTag, documentId, content] : [containerTag, documentId])).first<{ id: string }>()
+    ).bind(...(content ? [containerTag, documentId, content] : [containerTag, documentId])).first<{ id: string; topic_revision: string | null; updated_at: string }>()
     : await env.DB.prepare(
-      `SELECT id FROM memories
+      `SELECT id, topic_revision, updated_at FROM memories
        WHERE container_tag = ? AND content = ? AND is_forgotten = 0
        ORDER BY updated_at DESC LIMIT 1`,
-    ).bind(containerTag, content).first<{ id: string }>();
+    ).bind(containerTag, content).first<{ id: string; topic_revision: string | null; updated_at: string }>();
   if (!row) return json({ id: null, message: "No matching memory found" });
-  const updated = await env.DB.prepare(
-    `UPDATE memories
-     SET is_forgotten = 1, vector_status = 'pending', vector_mutation_id = NULL,
-         vector_attempted_at = NULL, updated_at = ?
-     WHERE id = ? AND container_tag = ? AND is_forgotten = 0`,
-  ).bind(new Date().toISOString(), row.id, containerTag).run();
-  if ((updated.meta.changes ?? 0) === 0) return json({ id: null, message: "No matching memory found" });
-  await invalidateDependentConsolidations(row.id, env, ctx);
+  const now = new Date().toISOString();
+  const revision = crypto.randomUUID();
+  const forgottenSql = "SELECT id FROM memories WHERE id = ? AND topic_revision = ? AND is_forgotten = 1";
+  const [updated] = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE memories
+       SET is_forgotten = 1, vector_status = 'pending', vector_mutation_id = NULL,
+           vector_attempted_at = NULL, topic_revision = ?, updated_at = ?
+       WHERE id = ? AND container_tag = ? AND is_forgotten = 0 AND topic_revision IS ? AND updated_at = ?`,
+    ).bind(revision, now, row.id, containerTag, row.topic_revision, row.updated_at),
+    env.DB.prepare(`DELETE FROM facts WHERE source_memory_id IN (${forgottenSql})`).bind(row.id, revision),
+    env.DB.prepare(`DELETE FROM memory_topics WHERE memory_id IN (${forgottenSql})`).bind(row.id, revision),
+    ...dependentConsolidationStatements(env, forgottenSql, [row.id, revision], now),
+  ]);
+  if ((updated?.meta.changes ?? 0) === 0) return json({ id: null, message: "No matching memory found" });
+  await cleanupInvalidatedConsolidations(row.id, now, env, ctx);
   await removeDerivedMemory(row.id, containerTag, env, ctx);
   return json({ id: row.id, message: "Memory forgotten" });
 }

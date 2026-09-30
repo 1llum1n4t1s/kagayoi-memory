@@ -53,7 +53,7 @@ function fixture() {
   const api = async (path, body, method = "POST") => {
     const response = await worker.fetch(new Request(`https://local.example${path}`, { method,
       headers: { Authorization: "Bearer local-fixture", "Content-Type": "application/json" }, body: JSON.stringify(body) }), env, ctx);
-    return { status: response.status, body: await response.json() };
+    return { status: response.status, body: response.status === 204 ? null : await response.json() };
   };
   return { db, DB, env, ctx, calls, api, respond(callback) { respond = callback; },
     drain: async () => { const results = []; while (waits.length) results.push(...await Promise.all(waits.splice(0))); return results; },
@@ -101,6 +101,52 @@ scenario("checkpoint retry keeps facts disabled and checkpoint active", async (f
   assert.equal((await f.api("/v4/enrich", { id: first.memoryId })).status, 202); await f.drain();
   assert.equal(f.active().length, 1); assert.equal(f.db.prepare("SELECT COUNT(*) AS count FROM facts WHERE source_memory_id = ?").get(first.memoryId).count, 0);
   assert.equal(f.db.prepare("SELECT fact_status FROM memories WHERE id = ?").get(first.memoryId).fact_status, "disabled");
+});
+scenario("checkpoint PATCH rejects edits without changing its active persisted state", async (f) => {
+  await f.seed(); const first = (await f.consolidate()).body; await f.drain();
+  const before = f.db.prepare("SELECT * FROM memories WHERE id = ?").get(first.memoryId);
+  for (const body of [{ content: "Edited checkpoint" }, { metadata: {} }]) {
+    const result = await f.api(`/v3/documents/${first.memoryId}`, body, "PATCH");
+    assert.equal(result.status, 409, JSON.stringify(result.body));
+    assert.deepEqual(f.db.prepare("SELECT * FROM memories WHERE id = ?").get(first.memoryId), before);
+    assert.equal(f.active()[0].memory_id, first.memoryId);
+  }
+});
+scenario("checkpoint custom-ID upsert rejects edits while ordinary source upserts stay supported", async (f) => {
+  const [sourceId] = await f.seed(); const first = (await f.consolidate()).body; await f.drain();
+  const before = f.db.prepare("SELECT * FROM memories WHERE id = ?").get(first.memoryId);
+  const result = await f.api("/v3/documents", { containerTag: "memories", customId: before.custom_id, content: "Edited checkpoint", metadata: {} });
+  assert.equal(result.status, 409, JSON.stringify(result.body));
+  assert.deepEqual(f.db.prepare("SELECT * FROM memories WHERE id = ?").get(first.memoryId), before);
+  assert.equal(f.active()[0].memory_id, first.memoryId);
+  const source = await f.api("/v3/documents", { containerTag: "memories", customId: "source-0", content: "Updated source", metadata: { sm_project_id: "log-project" } });
+  assert.equal(source.status, 201); assert.equal(source.body.id, sourceId); await f.drain();
+  assert.equal(f.active().length, 0);
+});
+for (const deleteCheckpoint of [false, true]) scenario(`hard delete ${deleteCheckpoint ? "checkpoint" : "legacy source"} restores facts in checkpoint container`, async (f) => {
+  const [survivingSource] = await f.seed(); f.env.AI_ENRICHMENT_MODE = "off";
+  const legacy = await f.api("/v3/documents", { containerTag: "legacy-space", customId: "legacy-source", content: "Legacy evidence", metadata: { sm_project_id: "log-project" } });
+  assert.equal(legacy.status, 201); f.env.AI_ENRICHMENT_MODE = "on";
+  const first = (await f.consolidate()).body; await f.drain();
+  const now = new Date().toISOString();
+  const insertFact = f.db.prepare(`INSERT INTO facts (
+    id, container_tag, source_memory_id, subject, predicate, object,
+    subject_key, predicate_key, object_key, is_exclusive, confidence, status, created_at, updated_at
+  ) VALUES (?, 'memories', ?, 'Source', 'has', ?, 'source', 'has', ?, 1, 1, ?, ?, ?)`);
+  insertFact.run("surviving-source-fact", survivingSource, "original evidence", "original evidence", "superseded", now, now);
+  insertFact.run("legacy-checkpoint-fact", first.memoryId, "synthetic checkpoint claim", "synthetic checkpoint claim", "active", now, now);
+  f.db.prepare(`INSERT INTO fact_relations (id, container_tag, from_fact_id, relation, to_fact_id, source_memory_id, confidence, created_at)
+    VALUES ('legacy-supersession', 'memories', 'legacy-checkpoint-fact', 'supersedes', 'surviving-source-fact', ?, 1, ?)`)
+    .run(first.memoryId, now);
+  const before = await f.api("/v4/profile", { containerTag: "memories" });
+  assert.deepEqual(before.body.profile.dynamic, ["Source has synthetic checkpoint claim"]);
+  const deletedId = deleteCheckpoint ? first.memoryId : legacy.body.id;
+  assert.equal((await f.api(`/v3/documents/${deletedId}`, undefined, "DELETE")).status, 204); await f.drain();
+  assert.equal(f.active().length, 0);
+  assert.equal(f.db.prepare("SELECT COUNT(*) AS count FROM facts WHERE source_memory_id = ?").get(first.memoryId).count, 0);
+  assert.equal(f.db.prepare("SELECT status FROM facts WHERE id = 'surviving-source-fact'").get().status, "active");
+  const after = await f.api("/v4/profile", { containerTag: "memories" });
+  assert.deepEqual(after.body.profile.dynamic, ["Source has original evidence"]);
 });
 scenario("legacy polluted checkpoint retry removes synthetic facts and restores superseded source profile", async (f) => {
   const [sourceId] = await f.seed(); const first = (await f.consolidate()).body; await f.drain();
@@ -238,6 +284,23 @@ scenario("derived data persistence failures report failed stages and errors", as
   assert.equal(log?.ok, false); assert.equal(log.facts, "failed"); assert.equal(log.topics, "failed"); assert.ok(log.errors.some((error) => error.includes("injected-derived-write-failure")));
   const row = f.db.prepare("SELECT fact_status, topic_status FROM memories WHERE id = ?").get(id); assert.equal(row.fact_status, "failed"); assert.equal(row.topic_status, "failed");
 });
+for (const recurring of [false, true]) scenario(`${recurring ? "recurring" : "initial"} scheduled consolidation redacts and bounds provider errors`, async (f, logs) => {
+  await f.seed(20);
+  if (recurring) {
+    assert.equal((await f.consolidate()).body.status, "consolidated"); await f.drain();
+    f.env.AI_ENRICHMENT_MODE = "off";
+    assert.equal((await f.api("/v3/documents", { containerTag: "memories", customId: "next-source", content: "Next evidence", metadata: { sm_project_id: "log-project" } })).status, 201);
+    f.env.AI_ENRICHMENT_MODE = "on";
+    f.db.prepare("UPDATE memory_consolidation_projects SET initial_backfill_completed = 1, last_success_at = '2020-01-01T00:00:00.000Z'").run();
+  }
+  f.respond(async () => { throw new Error(`injected-consolidation-failure ${f.env.MEMORY_API_KEY} ${"x".repeat(2_500)}`); });
+  worker.scheduled({ cron: "0 18 * * *", scheduledTime: Date.now() }, f.env, f.ctx);
+  await f.drain();
+  const log = logs.find((entry) => entry.event === (recurring ? "memory_consolidation_failed" : "memory_initial_backfill_failed"));
+  assert.match(log?.error, /injected-consolidation-failure/u);
+  assert.ok(log.error.includes("[redacted]")); assert.equal(log.error.length, 2_000);
+  assert.ok(!JSON.stringify(logs).includes(f.env.MEMORY_API_KEY)); assert.equal(f.lease(), null);
+});
 for (const cron of ["0 18 * * *", "*/15 * * * *"]) scenario(`cron ${cron} outer database failure logs and rejects`, async (f, logs) => {
   f.env.AI_ENRICHMENT_MODE = "on";
   f.DB.hooks.all = () => { throw new Error(`injected-cron-db-failure ${f.env.MEMORY_API_KEY}`); };
@@ -245,6 +308,80 @@ for (const cron of ["0 18 * * *", "*/15 * * * *"]) scenario(`cron ${cron} outer 
   const results = await f.drain(); assert.ok(results.some((r) => r.status === "rejected" && r.error.includes("injected-cron-db-failure")));
   const log = logs.find((entry) => entry.event === "scheduled_failed"); assert.equal(log?.cron, cron); assert.match(log.error, /injected-cron-db-failure/u);
   assert.ok(!JSON.stringify(logs).includes(f.env.MEMORY_API_KEY));
+});
+
+// DB/AI/Vectorizeの例外が縮退・削除・再試行の各経路へ届く場合を先に列挙して検証する。
+function providerFailure(f) { return new Error(`injected-provider-failure ${f.env.MEMORY_API_KEY} ${"x".repeat(2_500)}`); }
+function boundedDiagnostics(f, logs, event, count = 1) {
+  const matches = logs.filter((entry) => entry.event === event);
+  assert.equal(matches.length, count, event);
+  for (const entry of matches) { assert.match(entry.error, /injected-provider-failure/u); assert.ok(entry.error.includes("[redacted]")); assert.equal(entry.error.length, 2_000); }
+  assert.ok(!JSON.stringify(logs).includes(f.env.MEMORY_API_KEY));
+}
+for (const failure of ["fallbacks", "hydration", "embedding"]) scenario(`search ${failure} failures preserve lexical results and safe diagnostics`, async (f, logs) => {
+  const [id] = await f.seed();
+  f.db.prepare("UPDATE memories SET embedding_json = ?, vector_status = 'indexed' WHERE id = ?").run(JSON.stringify(embedding), id);
+  f.DB.hooks.all = (sql) => {
+    if (sql.includes("memories_fts MATCH")) throw providerFailure(f);
+    if (failure === "fallbacks" && sql.includes("embedding_json IS NOT NULL")) throw providerFailure(f);
+    if (failure === "hydration" && sql.includes("AND id IN (")) throw providerFailure(f);
+  };
+  f.env.MEMORY_VECTORS.query = async () => {
+    if (failure === "fallbacks") throw providerFailure(f);
+    return { matches: [{ id, score: 1 }], count: 1 };
+  };
+  if (failure === "embedding") f.env.AI.run = async () => { throw providerFailure(f); };
+  const result = await f.api("/v3/search", { q: "Verified", containerTag: "memories" });
+  assert.equal(result.status, 200); assert.ok(result.body.results.some((row) => row.id === id));
+  boundedDiagnostics(f, logs, "fts_search_failed");
+  if (failure === "fallbacks") { boundedDiagnostics(f, logs, "vector_query_failed"); boundedDiagnostics(f, logs, "semantic_fallback_failed", 2); }
+  if (failure === "hydration") boundedDiagnostics(f, logs, "vector_hit_hydration_failed");
+  if (failure === "embedding") boundedDiagnostics(f, logs, "semantic_search_failed");
+});
+for (const hardDelete of [false, true]) scenario(`${hardDelete ? "hard delete" : "forget"} accepts deletion despite safe vector failure log`, async (f, logs) => {
+  const [id] = await f.seed(); f.env.MEMORY_VECTORS.deleteByIds = async () => { throw providerFailure(f); };
+  const result = hardDelete ? await f.api(`/v3/documents/${id}`, undefined, "DELETE")
+    : await f.api("/v4/memories", { containerTag: "memories", documentId: id }, "DELETE");
+  assert.equal(result.status, hardDelete ? 204 : 200); await f.drain();
+  const row = f.db.prepare("SELECT is_forgotten FROM memories WHERE id = ?").get(id);
+  assert.equal(hardDelete ? row : row.is_forgotten, hardDelete ? undefined : 1);
+  boundedDiagnostics(f, logs, "vector_delete_failed");
+});
+for (const failure of ["lookup", "delete", "upsert"]) scenario(`scheduled vector ${failure} failure leaves retry state and safe diagnostics`, async (f, logs) => {
+  const [id] = await f.seed();
+  if (failure === "upsert") {
+    f.db.prepare("UPDATE memories SET embedding_json = ?, vector_status = 'pending' WHERE id = ?").run(JSON.stringify(embedding), id);
+    f.env.MEMORY_VECTORS.upsert = async () => { throw providerFailure(f); };
+  } else {
+    assert.equal((await f.api("/v4/memories", { containerTag: "memories", documentId: id }, "DELETE")).status, 200); await f.drain();
+    f.env.AI_ENRICHMENT_MODE = "off";
+    f.env.MEMORY_VECTORS.getByIds = async () => { if (failure === "lookup") throw providerFailure(f); return [{ id }]; };
+    if (failure === "delete") f.env.MEMORY_VECTORS.deleteByIds = async () => { throw providerFailure(f); };
+  }
+  worker.scheduled({ cron: "*/15 * * * *", scheduledTime: Date.now() }, f.env, f.ctx); await f.drain();
+  const row = f.db.prepare("SELECT vector_status, enrichment_error FROM memories WHERE id = ?").get(id);
+  assert.equal(row.vector_status, failure === "upsert" ? "failed" : "pending");
+  boundedDiagnostics(f, logs, failure === "upsert" ? "vector_reconcile_failed" : `forgotten_vector_${failure}_failed`);
+  if (failure === "upsert") { assert.equal(row.enrichment_error.length, 2_000); assert.ok(!row.enrichment_error.includes(f.env.MEMORY_API_KEY)); }
+});
+scenario("late enrichment upsert deletion failure remains retryable with safe diagnostics", async (f, logs) => {
+  const [id] = await f.seed();
+  f.env.MEMORY_VECTORS.upsert = async () => { f.db.prepare("UPDATE memories SET is_forgotten = 1 WHERE id = ?").run(id); return {}; };
+  f.env.MEMORY_VECTORS.deleteByIds = async () => { throw providerFailure(f); };
+  assert.equal((await f.api("/v4/enrich", { id })).status, 202); await f.drain();
+  const row = f.db.prepare("SELECT is_forgotten, vector_status FROM memories WHERE id = ?").get(id);
+  assert.equal(row.is_forgotten, 1); assert.equal(row.vector_status, "pending");
+  boundedDiagnostics(f, logs, "late_vector_delete_failed");
+});
+scenario("restored vector repair failure persists safe diagnostics and permits later retry", async (f, logs) => {
+  const [id] = await f.seed();
+  f.env.MEMORY_VECTORS.deleteByIds = async () => { f.db.prepare("UPDATE memories SET is_forgotten = 0, embedding_json = ? WHERE id = ?").run(JSON.stringify(embedding), id); return {}; };
+  f.env.MEMORY_VECTORS.upsert = async () => { throw providerFailure(f); };
+  assert.equal((await f.api("/v4/memories", { containerTag: "memories", documentId: id }, "DELETE")).status, 200); await f.drain();
+  const row = f.db.prepare("SELECT is_forgotten, vector_status, vector_attempted_at, enrichment_error FROM memories WHERE id = ?").get(id);
+  assert.equal(row.is_forgotten, 0); assert.equal(row.vector_status, "failed"); assert.equal(row.vector_attempted_at, null);
+  assert.equal(row.enrichment_error.length, 2_000); assert.ok(!row.enrichment_error.includes(f.env.MEMORY_API_KEY));
+  boundedDiagnostics(f, logs, "vector_restore_after_delete_failed");
 });
 
 const report = { command: "node --experimental-transform-types server/tests/log-regressions.mjs", node: process.version, migrations, scope: "authenticated Worker API and scheduled entry points with migrated real SQLite and deterministic local AI/vector fixtures", results: [] };
