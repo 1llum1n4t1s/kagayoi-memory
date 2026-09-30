@@ -62,7 +62,15 @@ export async function api(path, { body, method = body ? "POST" : "GET", timeoutM
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(timeoutMs),
   });
-  if (!response.ok) throw new Error(`Kagayoi Memory API request failed (HTTP ${response.status})`);
+  if (!response.ok) {
+    const error = new Error(`Kagayoi Memory API request failed (HTTP ${response.status})`);
+    error.status = response.status;
+    if (response.status === 400) {
+      const detail = await response.json().catch(() => null);
+      error.unsupportedGlobalSearch = /container.?tag.*required|all.?containers.*(?:unsupported|invalid|unknown)|unsupported.*all.?containers/i.test(String(detail?.error?.message || detail?.error || detail?.message || ""));
+    }
+    throw error;
+  }
   return response.status === 204 ? null : response.json();
 }
 
@@ -87,10 +95,14 @@ export function queryTerms(query) {
   return unique([...useful.filter(({ value }) => !compounded.has(value)).map(({ value }) => value), ...compounds]).slice(0, 30);
 }
 
-function topicRelevance(index, terms) {
-  const topic = `${index.title} ${index.description} ${(index.sections || []).join(" ")} ${(index.topics || []).join(" ")}`.toLowerCase();
+function matchingTerms(index, terms, withExcerpt = true) {
+  const topic = `${index.title} ${index.description} ${(index.sections || []).join(" ")} ${(index.topics || []).join(" ")} ${withExcerpt ? index.searchExcerpt || "" : ""}`.toLowerCase();
+  return terms.filter((term) => topic.includes(term));
+}
+
+function topicRelevance(index, terms, withExcerpt = true) {
   if (!terms.length) return 0;
-  const matches = terms.filter((term) => topic.includes(term));
+  const matches = matchingTerms(index, terms, withExcerpt);
   if (!matches.length) return 0;
   return matches.reduce((total, term) => total + Math.min(12, term.length), 0) / terms.reduce((total, term) => total + Math.min(12, term.length), 0);
 }
@@ -136,16 +148,36 @@ async function mapConcurrent(values, concurrency, task) {
 export async function searchIndex({ query = "", containerTag, cwd, settings = readSettings(), context, limit = settings.maxMemories, request = api, automatic = false } = {}) {
   query = typeof query === "string" ? query.trim().slice(0, 1_000) : "";
   if (!query) return { query, containerTag: containerTag || null, searchScope: "none", searchedContainers: [], failedContainers: [], failedDocuments: [], spaceDiscoveryComplete: true, results: [], total: 0 };
-  const discovery = containerTag ? { tags: [containerTag], complete: true, returnedCount: 1 } : await discoverSearchContainers(request);
+  let globalResponse;
+  if (!containerTag) {
+    try {
+      const response = await request("/v4/search", {
+        body: { allContainers: true, q: query, limit: 40, ...(automatic ? { indexOnly: true } : {}) },
+      });
+      if (response?.searchScope === "all-containers") {
+        if (!Array.isArray(response.results) || !Array.isArray(response.searchedContainers) || response.spaceDiscoveryComplete !== true) {
+          throw new Error("Invalid global memory search response");
+        }
+        globalResponse = response;
+      }
+    } catch (error) {
+      const unsupported = [404, 501].includes(error?.status) || error?.status === 400 &&
+        (error.unsupportedGlobalSearch || /container.?tag.*required|all.?containers.*unsupported/i.test(error.message));
+      if (!unsupported) throw error;
+    }
+  }
+  const discovery = globalResponse
+    ? { tags: unique(globalResponse.searchedContainers), complete: true, returnedCount: globalResponse.searchedContainers.length }
+    : containerTag ? { tags: [containerTag], complete: true, returnedCount: 1 } : await discoverSearchContainers(request);
   const tags = discovery.tags;
-  const results = await mapConcurrent(tags, SEARCH_CONCURRENCY, async (tag) => {
+  const results = globalResponse ? [{ status: "fulfilled", value: globalResponse.results.map((row, rank) => ({ row, rank, index: documentIndex(row) })) }] : await mapConcurrent(tags, SEARCH_CONCURRENCY, async (tag) => {
     const response = await request("/v4/search", {
       body: { containerTag: tag, q: query, limit: 20, ...(automatic ? { indexOnly: true } : {}) },
     });
     if (!Array.isArray(response?.results)) throw new Error("Invalid memory search response");
     return response.results.map((row, rank) => ({ row, rank, index: documentIndex(row, tag) }));
   });
-  const failedTags = tags.filter((_, i) => results[i].status === "rejected");
+  const failedTags = globalResponse ? [] : tags.filter((_, i) => results[i].status === "rejected");
   if (tags.length && failedTags.length === tags.length) throw new Error("Kagayoi Memory search unavailable for all requested spaces");
   const terms = queryTerms(query);
   const rawCandidates = results.flatMap((r) => r.status === "fulfilled" ? r.value : []).filter(({ row, index }) => {
@@ -175,17 +207,13 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
   const hydrated = hydratedResults.filter((result) => result.status === "fulfilled").map((result) => result.value);
   const eligible = hydrated.filter(({ row, index }) =>
     semanticEligible(row, settings.minimumSimilarity) || lexicalEligible(row) || topicRelevance(index, terms) > 0);
-  let candidates = eligible.filter(({ index }) =>
+  const candidates = eligible.filter(({ index }) =>
     !automatic || index.recallable && topicRelevance(index, terms) > 0);
-  if (automatic) {
-    const coveredSourceIds = new Set(candidates.filter(({ index }) => index.consolidation)
-      .flatMap(({ index }) => index.sourceMemoryIds));
-    candidates = candidates.filter(({ index }) => index.consolidation || !coveredSourceIds.has(index.id));
-  }
   candidates.sort((a, b) => {
     const topicDifference = topicRelevance(b.index, terms) - topicRelevance(a.index, terms);
+    const indexDifference = topicRelevance(b.index, terms, false) - topicRelevance(a.index, terms, false);
     const consolidationDifference = automatic ? Number(b.index.consolidation) - Number(a.index.consolidation) : 0;
-    return consolidationDifference || topicDifference || Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank ||
+    return topicDifference || indexDifference || consolidationDifference || Number(b.row.semanticSimilarity ?? -1) - Number(a.row.semanticSimilarity ?? -1) || a.rank - b.rank ||
       String(b.index.consolidationCreatedAt || "").localeCompare(String(a.index.consolidationCreatedAt || "")) ||
       String(b.index.sourceUpdatedAt || b.index.updatedAt || "").localeCompare(String(a.index.sourceUpdatedAt || a.index.updatedAt || ""));
   });
@@ -195,13 +223,16 @@ export async function searchIndex({ query = "", containerTag, cwd, settings = re
     const key = `${index.containerTag}:${index.id}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    // 最終選択済みの清書が検索語も覆うときだけ、同じ原文の重複を抑える。
+    if (automatic && !index.consolidation && documents.some((checkpoint) => checkpoint.consolidation &&
+      checkpoint.sourceMemoryIds.includes(index.id) && matchingTerms(index, terms).every((term) => matchingTerms(checkpoint, terms).includes(term)))) continue;
     documents.push(index);
     if (documents.length >= Math.min(20, Math.max(1, limit))) break;
   }
   return {
     query,
     containerTag: containerTag || null,
-    searchScope: containerTag ? "explicit-container" : "all-discovered-containers",
+    searchScope: containerTag ? "explicit-container" : globalResponse ? "all-containers" : "all-discovered-containers",
     searchedContainers: tags,
     failedContainers: failedTags,
     failedDocuments,

@@ -181,10 +181,14 @@ test("全保存先の話題検索は作業場所を解決せず実行できる",
   const result = await callTool("search_memory", { query: "Chrome拡張機能" }, {
     resolveContext: async () => { contextResolutions += 1; throw new Error("must not resolve"); },
     settings: { recallMode: "direct", maxMemories: 5, minimumSimilarity: 0.7 },
-    request: async (path) => path === "/v3/container-tags" ? { spaces: [] } : assert.fail(`unexpected request: ${path}`),
+    request: async (path, { body }) => {
+      assert.equal(path, "/v4/search");
+      assert.equal(body.allContainers, true);
+      return { searchScope: "all-containers", searchedContainers: [], spaceDiscoveryComplete: true, results: [] };
+    },
   });
   assert.equal(contextResolutions, 0);
-  assert.equal(result.structuredContent.searchScope, "all-discovered-containers");
+  assert.equal(result.structuredContent.searchScope, "all-containers");
   assert.deepEqual(result.structuredContent.results, []);
 });
 

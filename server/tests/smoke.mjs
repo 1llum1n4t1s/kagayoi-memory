@@ -1,9 +1,11 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import assert from "node:assert/strict";
+import { api, readDocument } from "../../client/memory-client.mjs";
+import { runHook } from "../../client/memory-hooks.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const wrangler = join(root, "node_modules", "wrangler", "bin", "wrangler.js");
@@ -385,6 +387,28 @@ try {
 
   await callMcp();
 
+  const responseSource = "# Transport reliability\n\n### User request\n接続を直して\n\n### Final assistant response\nHttpRecallNeedle は AbortSignal.timeout の設定で解決しました。";
+  const responseRecord = await request("/v3/documents", {
+    method: "POST", body: JSON.stringify({ containerTag: "http-recall", customId: "http-response-only", content: responseSource,
+      metadata: { sm_project_id: "http-project", topics: ["HTTP Recall"], memoryIndex: { version: 1, title: "Transport reliability", description: "接続を直して", sections: [], recallable: true } } }),
+  }).then((response) => response.json());
+  const recallCalls = [];
+  const localApi = (path, options = {}) => {
+    recallCalls.push(path);
+    return api(path, { ...options, config: { baseUrl, apiKey: token } });
+  };
+  const hook = await runHook("UserPromptSubmit", { prompt: "HttpRecallNeedle" }, {
+    settings: { recallMode: "direct", maxMemories: 5, minimumSimilarity: 0.7 }, context: {}, request: localApi,
+  });
+  assert.match(hook.hookSpecificOutput.additionalContext, new RegExp(responseRecord.id));
+  assert.match(hook.hookSpecificOutput.additionalContext, /原文の該当箇所.*HttpRecallNeedle/u);
+  assert.deepEqual(recallCalls, ["/v4/search"]);
+  const original = await readDocument(responseRecord.id, localApi);
+  assert.match(original.text, /AbortSignal\.timeout/u);
+  const artifact = resolve(root, "../dist/recall-http-validation.json");
+  mkdirSync(resolve(artifact, ".."), { recursive: true });
+  writeFileSync(artifact, `${JSON.stringify({ node: process.version, runtime: "Wrangler local/workerd + local D1 + authenticated HTTP + real hook/API/getDocument", passed: true, recallHttpRequests: 1, fullSourcePreserved: true }, null, 2)}\n`);
+
   const forgotten = await request("/v4/memories", {
     method: "DELETE",
     body: JSON.stringify({ containerTag, content: "記憶データはKagayoi MemoryからCloudflare D1へ保存する" }),
@@ -403,6 +427,32 @@ try {
     body: JSON.stringify({ containerTag, q: "Cloudflare D1" }),
   });
   assert.equal((await afterForget.json()).results.length, 0);
+
+  // 最大長の旧・現行文書が同じ検索に集まっても、実workerdで索引応答を作れることを確認する。
+  const capacitySuffix = "\nCapacityNeedle source ending";
+  const longSource = `${"漢".repeat(200_000 - capacitySuffix.length)}${capacitySuffix}`;
+  for (let index = 0; index < 50; index += 1) {
+    const saved = await request("/v3/documents", { method: "POST", body: JSON.stringify({
+      containerTag: "capacity-local", customId: `capacity-${index}`, content: longSource,
+      metadata: { title: "CapacityNeedle", ...(index % 2 ? { memoryIndex: {
+        version: 1, title: "CapacityNeedle", description: "CapacityNeedle retrieval", sections: [], recallable: true,
+      } } : {}) },
+    }) });
+    assert.equal(saved.status, 201);
+  }
+  const capacityStarted = performance.now();
+  const capacity = await request("/v4/search", { method: "POST", body: JSON.stringify({
+    allContainers: true, indexOnly: true, q: "CapacityNeedle", limit: 50,
+  }) });
+  assert.equal(capacity.status, 200);
+  const capacityText = await capacity.text();
+  const capacityBody = JSON.parse(capacityText);
+  assert.equal(capacityBody.results.length, 50);
+  assert.ok(capacityBody.results.every((record) => !record.content && !record.memory && record.metadata.memoryIndex.version === 1));
+  assert.ok(Buffer.byteLength(capacityText) < 100_000);
+  writeFileSync(artifact, `${JSON.stringify({ node: process.version, runtime: "Wrangler local/workerd + local D1 + authenticated HTTP + real hook/API/getDocument", passed: true,
+    recallHttpRequests: 1, fullSourcePreserved: true, capacity: { records: 50, sourceCharactersEach: longSource.length, legacyRecords: 25,
+      responseBytes: Buffer.byteLength(capacityText), elapsedMs: performance.now() - capacityStarted, cloudflareProductionLatencyMeasured: false } }, null, 2)}\n`);
 
   console.log("Kagayoi Memory smoke tests passed: auth, save/upsert, search, topics, list, graph, MCP, forget");
 } finally {

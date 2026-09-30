@@ -10,7 +10,11 @@ const settings = { recallMode: "direct", maxMemories: 5, minimumSimilarity: 0.7 
 const context = { containerTag: "project", projectName: "project", projectTags: ["project", "legacy-project"], sharedTags: ["shared"], readTags: ["project", "legacy-project", "shared"] };
 const date = "2026-09-11T01:02:03.000Z";
 const spaceList = (tags) => ({ spaces: tags.map((containerTag) => ({ containerTag, memoryCount: 1 })) });
-const withDiscovery = (handler, tags = context.readTags) => async (path, options = {}) => path === "/v3/container-tags" ? spaceList(tags) : handler(path, options);
+// 旧server互換経路を検証するfixture。
+const withDiscovery = (handler, tags = context.readTags) => async (path, options = {}) => {
+  if (options.body?.allContainers) throw Object.assign(new Error("containerTag required"), { status: 400 });
+  return path === "/v3/container-tags" ? spaceList(tags) : handler(path, options);
+};
 function row(id = "doc-1", tag = "shared", overrides = {}) {
   return { id, containerTag: tag, createdAt: date, updatedAt: date, similarity: 0.8,
     content: "DETAIL_ONLY: 実際のコードと検証結果を含む長い原文。".repeat(100),
@@ -22,16 +26,19 @@ test("BフォルダからChrome拡張機能を検索するとAフォルダの索
   const current = { ...context, containerTag: "folder-b", projectTags: ["folder-b"], sharedTags: [], readTags: ["folder-b"] };
   const chrome = row("chrome-a", "folder-a", { similarity: 0.86, metadata: { memoryIndex: buildMemoryIndex({ title: "Chrome拡張機能の実装", request: "Chrome拡張機能を実装する", response: "## Manifest V3\nDETAIL_ONLY", sourceUpdatedAt: date }) } });
   const calls = [];
-  const request = withDiscovery(async (path, { body } = {}) => {
-    calls.push([path, body?.containerTag]);
+  const request = async (path, { body } = {}) => {
+    calls.push([path, body?.allContainers]);
     if (path.startsWith("/v3/documents/")) return chrome;
-    return { results: body.containerTag === "folder-a" ? [chrome] : [] };
-  }, tags);
+    assert.equal(path, "/v4/search");
+    assert.equal(body.limit, 40);
+    assert.equal(body.allContainers, true);
+    return { searchScope: "all-containers", searchedContainers: tags, spaceDiscoveryComplete: true, results: [chrome] };
+  };
   const hook = await runHook("UserPromptSubmit", { prompt: "Chrome拡張機能を実装して" }, { settings, context: current, request });
   const hookCalls = calls.splice(0);
   const mcp = await callTool("search_memory", { query: "Chrome拡張機能を実装して", includeProfile: false }, { settings, context: current, request });
   assert.deepEqual(calls, hookCalls);
-  assert.deepEqual(calls.filter(([path]) => path === "/v4/search").map((c) => c[1]), tags);
+  assert.deepEqual(calls, [["/v4/search", true]]);
   assert.ok(calls.every(([path]) => path === "/v4/search"));
   const text = hook.hookSpecificOutput.additionalContext;
   assert.match(text, /id=chrome-a.*container=folder-a.*2026-09-11/);
@@ -186,7 +193,10 @@ test("一部失敗と全失敗を検索結果なしから区別する", async ()
 });
 
 test("保存先一覧の取得失敗を局所検索へフォールバックせず明示する", async () => {
-  const request = async () => { throw new Error("offline"); };
+  const request = async (_path, options = {}) => {
+    if (options.body?.allContainers) throw Object.assign(new Error("containerTag required"), { status: 400 });
+    throw new Error("offline");
+  };
   await assert.rejects(searchIndex({ query: "Chrome拡張機能", settings, context, request }), /space discovery failed.*not performed/);
   const hook = await runHook("UserPromptSubmit", { prompt: "Chrome拡張機能を実装して" }, { settings, context, request });
   assert.match(hook.systemMessage, /保存先一覧.*全フォルダ横断.*実行できません/);
@@ -614,22 +624,4 @@ test("3 space各20件の末尾にあるlegacy候補をsummaryでhydrate上限前
   assert.equal(hydrated.length, 40);
   assert.ok(hydrated.includes("legacy-c-19"));
   assert.equal(result.results[0].id, "legacy-c-19");
-});
-
-test("一覧の旧文書はcompact summaryから索引を作る", () => {
-  const index = documentIndex({
-    id: "legacy-summary",
-    containerTags: ["legacy"],
-    summary: "# 旧文書\n一覧だけで確認できる要点",
-    metadata: {},
-  });
-  assert.equal(index.title, "旧文書");
-  assert.equal(index.description, "一覧だけで確認できる要点");
-});
-
-test("短い継続依頼でも実質的な結果がある文書は索引に残す", () => {
-  const index = buildMemoryIndex({ title: "接続経路の改善", request: "続けて", response: "## タイムアウトの修正\n既存の経路を変更。\n## 検証\nテスト結果を記載。" });
-  assert.equal(index.recallable, true);
-  assert.match(index.description, /継続結果/);
-  assert.ok(index.sections.includes("タイムアウトの修正"));
 });

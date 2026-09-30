@@ -1814,14 +1814,17 @@ test("search and document-list compact projections omit full content without cha
     assert.equal(legacySearch.results[0].id, legacy.id);
     assert.equal("content" in legacySearch.results[0], false);
     assert.equal("memory" in legacySearch.results[0], false);
-    assert.match(legacySearch.results[0].summary, /# Tail heading\nTailNeedle/);
-    assert.ok(legacySearch.results[0].summary.length <= 4_002);
+    assert.equal(legacySearch.results[0].metadata.memoryIndex.version, 1);
+    assert.equal(legacySearch.results[0].metadata.memoryIndex.title, "Tail heading");
+    assert.match(legacySearch.results[0].searchExcerpt, /# Tail heading\nTailNeedle/);
+    assert.ok(legacySearch.results[0].searchExcerpt.length <= 240);
+    assert.equal("summary" in legacySearch.results[0], false);
   } finally {
     database.close();
   }
 });
 
-test("FTS score preserves stronger-first order and indexOnly excludes body-only v1 crowding", async () => {
+test("FTS score preserves stronger-first order and indexOnly prioritizes index hits before body excerpts", async () => {
   const database = openDatabase();
   try {
     const DB = d1Adapter(database);
@@ -1894,9 +1897,10 @@ test("FTS score preserves stronger-first order and indexOnly excludes body-only 
       limit: 20,
       indexOnly: true,
     }), env, ctx).then((response) => response.json());
-    assert.deepEqual(new Set(compact.results.map(({ id }) => id)), new Set([indexed.id, topic.id]));
+    assert.deepEqual(new Set(compact.results.slice(0, 2).map(({ id }) => id)), new Set([indexed.id, topic.id]));
+    assert.ok(compact.results.slice(2).every((result) => result.searchExcerpt?.includes("CrowdingNeedle")));
     assert.ok(compact.results.every((result) => !("content" in result) && !("memory" in result)));
-    assert.ok(ftsPages >= 2, "body-only rows should be paged past before applying the candidate limit");
+    assert.equal(ftsPages, 1, "index priority should select useful entries in one bounded FTS read");
 
     const ecole = await worker.fetch(request("/v3/documents", {
       containerTag: "unicode-index",
@@ -2030,8 +2034,8 @@ test("indexOnly SQL projects v1 content away across recent, lexical, semantic, a
       limit: 10,
     }), plainEnv, ctx).then((response) => response.json());
     assertProjection(selected.find(({ sql }) => sql.includes("FROM memories_fts")));
-    assert.match(lexicalProjection.results.find(({ id }) => id === booleanVersion.id)?.summary ?? "", /boolean version/);
-    assert.match(lexicalProjection.results.find(({ id }) => id === unknownVersion.id)?.summary ?? "", /unknown version/);
+    assert.match(lexicalProjection.results.find(({ id }) => id === booleanVersion.id)?.metadata.memoryIndex.description ?? "", /boolean version/);
+    assert.match(lexicalProjection.results.find(({ id }) => id === unknownVersion.id)?.metadata.memoryIndex.description ?? "", /unknown version/);
 
     selected = [];
     await worker.fetch(request("/v4/search", {

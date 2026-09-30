@@ -135,6 +135,7 @@ export function documentIndex(document, fallbackContainer, terms = []) {
     part: Number.isInteger(metadata.part) ? metadata.part : undefined,
     parts: Number.isInteger(metadata.parts) ? metadata.parts : undefined,
     consolidation,
+    ...(typeof document.searchExcerpt === "string" && document.searchExcerpt.trim() ? { searchExcerpt: shortText(document.searchExcerpt, 240) } : {}),
     sourceMemoryIds,
     consolidationCreatedAt: validDate(metadata.consolidationCreatedAt),
     evidence: "historical record; inspect the document before relying on it",
@@ -165,9 +166,10 @@ export function formatIndexItem(item) {
   const sections = item.sections?.length ? `（収録: ${item.sections.slice(0, 2).map((value) => promptText(value, 60)).join("、")}）` : "";
   const parts = item.parts > 1 ? ` | part=${item.part}/${item.parts}` : "";
   const kind = item.consolidation ? " | kind=consolidated-checkpoint" : "";
+  const excerpt = item.searchExcerpt ? `\n  原文の該当箇所: ${promptText(item.searchExcerpt, 240)}` : "";
   const topics = item.topics?.length ? ` | topics=${item.topics.map((value) => promptText(value, 100)).join(", ")}` : "";
   const provenance = item.provenance?.project || item.provenance?.projectId || item.provenance?.containerTag
     ? ` | provenance=${promptText(item.provenance.project || item.provenance.projectId || item.provenance.containerTag, 160)}${item.provenance.project && item.provenance.projectId ? ` (${promptText(item.provenance.projectId, 160)})` : ""}`
     : "";
-  return `- ◪ ${promptText(item.title, 100)}${when}${sections}\n  id=${promptText(item.id, 80)}${topics} | container=${promptText(item.containerTag || "unknown", 160)}${provenance} | ${item.sourceUpdatedAt ? "sourceDate" : "storedDate"}=${promptText(timestamp, 40)}${parts}${kind}`;
+  return `- ◪ ${promptText(item.title, 100)}${when}${sections}\n  id=${promptText(item.id, 80)}${topics} | container=${promptText(item.containerTag || "unknown", 160)}${provenance} | ${item.sourceUpdatedAt ? "sourceDate" : "storedDate"}=${promptText(timestamp, 40)}${parts}${kind}${excerpt}`;
 }

@@ -2,7 +2,7 @@
 
 A Codex plugin and self-hosted Cloudflare backend for recalling useful implementation history across project folders.
 
-The plugin saves completed work in a shared collection and keeps its project folder as provenance. Browse records by content topics, or ask about a topic such as “Chrome extension”: recall searches every discovered memory space, injects concise indexes, and lets Codex open an applicable source record through MCP before reusing the implementation.
+The plugin saves completed work in a shared collection and keeps its project folder as provenance. Browse records by content topics, or ask about a topic such as “Chrome extension”: recall searches across memory spaces in one server request, injects concise indexes, and lets Codex open an applicable source record through MCP before reusing the implementation.
 
 ## Requirements
 
@@ -43,13 +43,14 @@ Keep the local Wrangler configuration for future updates. Never commit generated
 - Completed user requests and final answers are saved in the shared `memories` collection with source-folder provenance. A deterministic capture identity makes retries reuse the same stored record instead of creating duplicates.
 - Use `listTopics` to find content categories, then pass a `topic` to `listDocuments` or `listMemories`. Lists include records across both legacy folder spaces and the shared collection. Use `topic: "__unclassified__"` to see records without current topic labels, including records whose classification failed, is disabled, or was deliberately skipped.
 - Manual `add_memory` saves to the shared collection. To forget a record after reading it, pass its `documentId` and source `containerTag`; exact stored content remains supported for compatibility. An absolute `sourceFolder` or a single workspace root supplied by the MCP client adds provenance; an explicit `containerTag` overrides storage. The plugin never uses its installation folder as the user's project. `listSpaces` exposes physical spaces for compatibility and diagnostics.
-- Prompt recall searches every discovered nonempty space by topic. The initial session event does not inject unrelated recent records.
+- Prompt recall searches all nonempty spaces by topic in one request, sharing one query embedding and Vectorize lookup. The initial session event does not inject unrelated recent records.
 - Automatic context contains a title, description, section names, timestamps, and document IDs. Codex opens full records with `getDocument` when needed.
 - The server checks projects daily at 03:00 JST. It asks Workers AI to create a consolidated checkpoint when a project has at least 20 unconsolidated records, or when it has unconsolidated records and three days have elapsed since the last successful checkpoint (before the first checkpoint, since the oldest pending record). On a project's first due run, the server automatically drains the entire existing backlog in successive bounded AI batches, so old records do not require a manual backfill command. Original records are retained and linked from the checkpoint. Older checkpoints are superseded, and changing or forgetting a source invalidates the checkpoint that depended on it.
 - Use the `consolidate_memory` MCP tool to advance the current workspace checkpoint by one batch immediately without waiting for the daily check. Pass `projectId` to target a known provenance ID, or `sourceFolder` when the MCP client does not provide exactly one workspace root. Each call handles at most 40 new records; repeat it if a larger backlog remains. Manual execution still requires at least one unconsolidated source record.
-- Automatic recall places a relevant current checkpoint before uncovered originals and does not repeat originals already represented by that checkpoint. Manual search continues to expose the original records.
+- Automatic recall prefers a current checkpoint at equal topic relevance and avoids repeating originals covered by a selected checkpoint. Specific matching details absent from the checkpoint still expose their originals. Manual search continues to expose the original records.
 - Capture redacts configured secrets and retries unacknowledged records. Local capture state stays under `kagayoi-memory/capture-state/` in the selected Codex home.
-- Space discovery is capped by the current server API at 100. A full page is reported as incomplete rather than claiming exhaustive search.
+- Global search includes spaces beyond the old discovery limit. For older servers, the compatibility discovery path remains capped at 100 and reports a full page as incomplete.
+- Legacy indexes are derived during search without migrating stored records. A short matching original passage can expose details that are absent from an index; it remains historical source text to verify before reuse.
 
 Topics are derived from record content during the existing Workers AI enrichment step. Classification is asynchronous. Brief acknowledgements without a substantial result, and similar low-information records, remain available to manual search but are excluded from automatic recall and enrichment; explicit topic labels are still retained. Folder names are retained as source metadata. Existing records keep their original document IDs and storage locations and appear in the same topic browser.
 
