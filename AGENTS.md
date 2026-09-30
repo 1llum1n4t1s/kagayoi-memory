@@ -10,6 +10,12 @@ This repository packages the Kagayoi Memory self-hosted Cloudflare server and it
 - Run client tests, server tests, plugin validation, and `git diff --check` for affected changes.
 - Do not deploy, migrate a remote database, publish a package, create a remote repository, push, run `scripts/setup-topics.mjs --apply` or `pnpm -C server test:live`, or invoke remote consolidation without an explicit request.
 
+## Dependency maintenance
+
+- Update `server/package.json` and `server/pnpm-lock.yaml` together, then verify the frozen-lockfile install and server checks below.
+- Review `server/pnpm-workspace.yaml` with dependency updates. It holds native build approvals for `esbuild` and `workerd` and exact-version `minimumReleaseAgeExclude` entries; replace obsolete exceptions when upgrading rather than broadening them to all versions.
+- Keep `.github/dependabot.yml` covering GitHub Actions and npm manifests in both `/` and `/server` on a weekly schedule, with minor and patch updates grouped separately from major updates.
+
 ## Validation
 
 Run these checks from the repository root for affected changes (Node.js 24.18.0 or later in the 24 series, pnpm 11.4.0):
@@ -23,7 +29,9 @@ pnpm run package:plugin
 git diff --check
 ```
 
-Server tests use local D1 and deterministic AI/vector fixtures. Provisioning tests simulate Wrangler calls without creating remote resources. When changing asynchronous enrichment, preserve revision guards and project-scoped fact relationships; validate stale topic/vector work and update/forget races in `server/tests/races.test.mjs`, plus the API coverage in `server/tests/smoke.mjs`. Vector changes must also cover bounded Vectorize lookups, forgotten-vector cleanup even when AI enrichment is disabled, and repair after late upserts or deletion races. Topic API changes must retain unclassified browsing and exact-topic filtering across legacy and shared spaces.
+Server tests use local D1 and deterministic AI/vector fixtures. Provisioning tests simulate Wrangler calls without creating remote resources. In `server/tests/smoke.mjs`, preserve bounded waits for local Worker startup and MCP responses; on Windows, stop the Wrangler process tree, including `workerd`, before removing temporary D1 state so database locks are released.
+
+When changing asynchronous enrichment, preserve revision guards and project-scoped fact relationships; validate stale topic/vector work and update/forget races in `server/tests/races.test.mjs`, plus the API coverage in `server/tests/smoke.mjs`. Vector changes must also cover bounded Vectorize lookups, forgotten-vector cleanup even when AI enrichment is disabled, and repair after late upserts or deletion races. Topic API changes must retain unclassified browsing and exact-topic filtering across legacy and shared spaces.
 
 Consolidation changes must preserve project leases, source-revision publication guards, exact source membership, invalidation after source or checkpoint mutation, the 40-source batch limit, one-batch manual requests, initial scheduled backlog draining, and the 25-project recurring cap. Preserve both Wrangler crons (`*/15 * * * *` for vector reconciliation and `0 18 * * *` for daily consolidation), and apply migration `0005_memory_consolidations.sql` before installing a client that depends on consolidation. Cover these contracts in `client/mcp-server.test.mjs`, `server/tests/races.test.mjs`, and the authenticated API path in `server/tests/smoke.mjs`.
 
