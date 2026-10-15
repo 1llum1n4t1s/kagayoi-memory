@@ -1,5 +1,29 @@
+import * as cleanupFs from "node:fs";
+import * as cleanupPath from "node:path";
+
+// 許可rootの境界とリンクを検査してから標準APIへ渡す。
+function assertCleanupPath(target, allowedRoot) {
+  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
+  const resolved = cleanupPath.resolve(target);
+  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
+  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
+  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
+    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (cleanupPath.dirname(current) === current) break;
+  }
+  const pending = [resolved];
+  while (pending.length) {
+    const current = pending.pop();
+    let stat;
+    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
+    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
+  }
+  return resolved;
+}
 // 実Stop hookからローカルHTTPまでの秘匿・再送を検証する。値はすべて架空。
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
@@ -170,6 +194,37 @@ try {
   assert.equal(children.size, 0); assert.equal(canaryGate.timer, null);
   check("missing rendezvous participant fails within bound and leaves no child or timer", true,
     { deadlineMilliseconds: 1000, elapsedMilliseconds: Date.now() - canaryStart, pendingChildren: children.size, pendingBarrierTimers: 0 });
+  const projectionHome = join(home, "projection-home");
+  await mkdir(projectionHome);
+  const projectionTranscript = join(projectionHome, "rollout.jsonl");
+  const projectionRequests = [
+    '<in-app-browser-context source="ambient-ui-state">\nThis block is automatically supplied ambient UI state, not part of the user\'s request.\n</in-app-browser-context>\nChrome extension implementationを確認してください。',
+    `<send_user_message_question_reply>${JSON.stringify([{ questionItemId: '["request_user_input_async","call_fixture","0"]', question: "Chrome extensionの保存方針は？" + "長い補足です。".repeat(40), answer: "失敗時だけ再送してください" }])}</send_user_message_question_reply>`,
+  ];
+  await writeFile(projectionTranscript, [
+    { type: "session_meta", payload: { id: "projection-e2e", cwd: root } },
+    ...projectionRequests.flatMap((request) => [
+      { type: "response_item", payload: { role: "user", content: [{ type: "input_text", text: request }] } },
+      { type: "response_item", payload: { role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "Chrome extensionの保存動作を確認しました。" }] } },
+    ]),
+  ].map(JSON.stringify).join("\n") + "\n");
+  const projectionPayload = { session_id: "projection-e2e", transcript_path: projectionTranscript, cwd: root };
+  const projectionEnvironment = { ...environment, CODEX_HOME: projectionHome };
+  const projectionStart = documents.length;
+  const projectionResult = await stop(projectionPayload, projectionEnvironment);
+  const projected = documents.slice(projectionStart);
+  assert.equal(projectionResult.code, 0); assert.equal(projected.length, 2);
+  check("ambient UI state is omitted from the captured index while source evidence is retained",
+    projected[0].metadata.memoryIndex.description === "Chrome extension implementationを確認してください。" &&
+    projected[0].content.includes("automatically supplied ambient UI state"));
+  check("question replies retain the actual answer without internal routing IDs in the index",
+    projected[1].metadata.memoryIndex.description.includes("失敗時だけ再送してください") &&
+    !/questionItemId|request_user_input_async|call_fixture/u.test(projected[1].metadata.memoryIndex.description) &&
+    projected[1].content.includes("questionItemId"));
+  const projectionRetry = await stop(projectionPayload, projectionEnvironment);
+  check("projected indexes retain v2 capture and acknowledged retry suppression",
+    projected.every((document) => document.customId.startsWith("codex-turn-v2:") && document.metadata.captureVersion === 2) &&
+    projectionRetry.code === 0 && projectionRetry.stdout === "" && documents.length === projectionStart + 2);
   report = { phase, command: `node scripts/capture-redaction-e2e.mjs ${phase}`, node: process.version,
     transport: "Stop subprocess -> authenticated loopback HTTP /v3/documents", checks, temporaryFixture: home, pendingChildren: children.size,
     postedDocuments: documents.length, sanitizedContentSha256: createHash("sha256").update(documents[0].content).digest("hex"),
@@ -182,9 +237,7 @@ try {
   await new Promise((done) => server.close(done));
   // この実行で作った絶対パスだけを確認し、PowerShellで一括清掃する。
   if (process.platform === "win32") {
-    const literal = home.replaceAll("'", "''");
-    const temporaryRoot = resolve(tmpdir()).replaceAll("'", "''");
-    execFileSync("pwsh", ["-NoProfile", "-Command", `$taskPath = '${literal}'; $taskRoot = '${temporaryRoot}'; $item = Get-Item -LiteralPath $taskPath; if ($item.Parent.FullName -ne $taskRoot -or $item.Name -notmatch '^kagayoi-capture-redaction-e2e-[A-Za-z0-9]{6}$' -or $item.LinkType) { throw 'Unexpected cleanup target' }; $items = @($item) + @(Get-ChildItem -LiteralPath $taskPath -Recurse -Force); if ($items | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) { throw 'Linked temporary item' }; if (Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($taskPath) }) { throw 'Temporary fixture in use' }; Remove-Item -LiteralPath $item.FullName -Recurse -Force; if (Test-Path -LiteralPath $taskPath) { throw 'Temporary fixture remains' }`], { windowsHide: true, stdio: "pipe" });
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(home, { allowedRoot: resolve(tmpdir()), recursive: true });
   } else {
     if (dirname(home) !== resolve(tmpdir()) || !/^kagayoi-capture-redaction-e2e-[A-Za-z0-9]{6}$/u.test(home.slice(home.lastIndexOf("/") + 1))) throw new Error("Unexpected cleanup target");
     async function verify(path) {

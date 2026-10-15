@@ -1,3 +1,27 @@
+import * as cleanupFs from "node:fs";
+import * as cleanupPath from "node:path";
+
+// 許可rootの境界とリンクを検査してから標準APIへ渡す。
+function assertCleanupPath(target, allowedRoot) {
+  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
+  const resolved = cleanupPath.resolve(target);
+  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
+  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
+  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
+    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (cleanupPath.dirname(current) === current) break;
+  }
+  const pending = [resolved];
+  while (pending.length) {
+    const current = pending.pop();
+    let stat;
+    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
+    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
+  }
+  return resolved;
+}
 // 失敗条件を先に固定: 非object設定/入力による例外、旧設定fallback喪失、
 // 一部文書取得失敗の隠蔽、全成功/全失敗通知の変化、既読・順位・サイズ契約の変化、
 // PreToolUseでの不要なclient読込み、Stop診断/権限/秘密の漏れ。実データは使わない。
@@ -74,7 +98,7 @@ try {
     check(`invalid current ${JSON.stringify(value)} falls back`, result?.recallMode === "off" && result.maxMemories === 2);
     await writeFile(legacy, JSON.stringify(value));
     const defaults = settings();
-    check(`invalid legacy ${JSON.stringify(value)} defaults`, defaults?.recallMode === "direct" && defaults.maxMemories === 5);
+    check(`invalid legacy ${JSON.stringify(value)} defaults`, defaults?.recallMode === "direct" && defaults.maxMemories === 3);
     const started = await run("SessionStart", {}, home);
     check(`SessionStart invalid settings ${JSON.stringify(value)}`, started.code === 0 && started.stdout === "" && started.stderr === "");
   }
@@ -93,7 +117,7 @@ try {
   const partial = await run("UserPromptSubmit", payload, home);
   const context = JSON.parse(partial.stdout).hookSpecificOutput.additionalContext;
   check("partial hydration count is visible", context.includes("Incomplete search: 0 spaces and 1 document indexes were unavailable."));
-  check("partial context preserves source and size", context.includes("good-index") && context.length <= 6000 && partial.code === 0 && partial.stderr === "");
+  check("partial context preserves source and size", context.includes("good-index") && context.length <= 3000 && partial.code === 0 && partial.stderr === "");
   check("partial failure does not expose IDs or error/key", ![marker, key].some(secret => context.includes(secret)));
   const statePath = join(home, "kagayoi-memory", "recall-state", `${createHash("sha256").update(payload.session_id).digest("hex")}.json`);
   const state = JSON.parse(await readFile(statePath, "utf8"));
@@ -133,9 +157,7 @@ try {
   await new Promise(done => server.close(done));
   assert.equal(children.size, 0, "No fixture subprocess may remain during cleanup");
   if (process.platform === "win32") {
-    const literal = fixture.replaceAll("'", "''");
-    const temporaryRoot = resolve(tmpdir()).replaceAll("'", "''");
-    execFileSync("pwsh", ["-NoProfile", "-Command", `$taskPath = '${literal}'; $taskRoot = '${temporaryRoot}'; $item = Get-Item -LiteralPath $taskPath; if ($item.Parent.FullName -ne $taskRoot -or $item.Name -notlike 'kagayoi-opop-client-e2e-*' -or $item.LinkType) { throw 'Unexpected cleanup target' }; if (Get-ChildItem -LiteralPath $taskPath -Recurse -Force | Where-Object LinkType) { throw 'Unexpected fixture link' }; if (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($taskPath) -and $_.ProcessId -ne $PID -and $_.Name -notin @('pwsh.exe', 'powershell.exe') }) { throw 'Fixture process remains' }; Remove-Item -LiteralPath $item.FullName -Recurse -Force; if (Test-Path -LiteralPath $taskPath) { throw 'Temporary fixture remains' }`]);
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(fixture, { allowedRoot: resolve(tmpdir()), recursive: true });
   } else {
     if (dirname(fixture) !== resolve(tmpdir()) || (await lstat(fixture)).isSymbolicLink()) throw new Error("Unexpected cleanup target");
     await rm(fixture, { recursive: true });

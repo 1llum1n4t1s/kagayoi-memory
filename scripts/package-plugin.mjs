@@ -1,5 +1,29 @@
+import * as cleanupFs from "node:fs";
+import * as cleanupPath from "node:path";
+
+// 許可rootの境界とリンクを検査してから標準APIへ渡す。
+function assertCleanupPath(target, allowedRoot) {
+  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
+  const resolved = cleanupPath.resolve(target);
+  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
+  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
+  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
+    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (cleanupPath.dirname(current) === current) break;
+  }
+  const pending = [resolved];
+  while (pending.length) {
+    const current = pending.pop();
+    let stat;
+    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
+    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
+  }
+  return resolved;
+}
 import { constants as fsConstants } from "node:fs";
-import { access, copyFile, lstat, mkdir, readdir, rename, rm } from "node:fs/promises";
+import { access, copyFile, lstat, mkdir, readdir, rename } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -114,17 +138,18 @@ export async function buildPackage({ root = REPOSITORY_ROOT, output = DEFAULT_OU
   const staging = `${resolvedOutput}.tmp-${process.pid}`;
   const files = await collectPackageFiles(resolvedRoot);
 
-  await rm(staging, { recursive: true, force: true });
+  await mkdir(path.resolve(resolvedRoot, "dist"), { recursive: true });
+  await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(staging, { allowedRoot: path.resolve(resolvedRoot, "dist"), recursive: true, force: true });
   try {
     for (const relativePath of files) {
       const destination = path.join(staging, relativePath);
       await mkdir(path.dirname(destination), { recursive: true });
       await copyFile(path.join(resolvedRoot, relativePath), destination);
     }
-    await rm(resolvedOutput, { recursive: true, force: true });
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(resolvedOutput, { allowedRoot: path.resolve(resolvedRoot, "dist"), recursive: true, force: true });
     await rename(staging, resolvedOutput);
   } catch (error) {
-    await rm(staging, { recursive: true, force: true });
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(staging, { allowedRoot: path.resolve(resolvedRoot, "dist"), recursive: true, force: true });
     throw error;
   }
 

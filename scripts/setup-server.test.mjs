@@ -1,5 +1,29 @@
+import * as cleanupFs from "node:fs";
+import * as cleanupPath from "node:path";
+
+// 許可rootの境界とリンクを検査してから標準APIへ渡す。
+function assertCleanupPath(target, allowedRoot) {
+  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
+  const resolved = cleanupPath.resolve(target);
+  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
+  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
+  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
+    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (cleanupPath.dirname(current) === current) break;
+  }
+  const pending = [resolved];
+  while (pending.length) {
+    const current = pending.pop();
+    let stat;
+    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
+    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
+  }
+  return resolved;
+}
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -105,7 +129,7 @@ test("argument validation rejects unsafe names and conflicting D1 placement", ()
 
 test("default dry run performs discovery without creating resources or writing config", async (t) => {
   const files = await fixture();
-  t.after(() => rm(files.root, { recursive: true, force: true }));
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
   const cloudflare = mockCloudflare();
   const lines = [];
   const result = await runSetup([], {
@@ -124,7 +148,7 @@ test("default dry run performs discovery without creating resources or writing c
 
 test("apply creates missing resources, writes config, migrates, deploys, and verifies", async (t) => {
   const files = await fixture();
-  t.after(() => rm(files.root, { recursive: true, force: true }));
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
   const cloudflare = mockCloudflare();
   const lines = [];
   const requests = [];
@@ -167,7 +191,7 @@ test("existing resources and secret are reused while custom config fields are pr
     "d1_databases": [{ "binding": "OTHER_DB", "database_name": "other", "database_id": "other-id" }],
   }`;
   const files = await fixture(existing);
-  t.after(() => rm(files.root, { recursive: true, force: true }));
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
   const cloudflare = mockCloudflare({
     d1: "22222222-2222-2222-2222-222222222222",
     vector: { dimensions: 1024, metric: "cosine" },
@@ -202,7 +226,7 @@ test("existing resources and secret are reused while custom config fields are pr
 
 test("1.x resource names are reused instead of creating an empty replacement store", async (t) => {
   const files = await fixture();
-  t.after(() => rm(files.root, { recursive: true, force: true }));
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
   const cloudflare = mockCloudflare({
     resourceName: "cloudflare-supermemory",
     workerName: "cloudflare-supermemory",
@@ -230,7 +254,7 @@ test("1.x resource names are reused instead of creating an empty replacement sto
 
 test("explicit Kagayoi Memory resource names are not replaced by discovered 1.x resources", async (t) => {
   const files = await fixture();
-  t.after(() => rm(files.root, { recursive: true, force: true }));
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
   const cloudflare = mockCloudflare({
     resourceName: "cloudflare-supermemory",
     workerName: "cloudflare-supermemory",
@@ -262,7 +286,7 @@ test("explicit Kagayoi Memory resource names are not replaced by discovered 1.x 
 
 test("apply fails before mutations when no existing or supplied Worker secret is available", async (t) => {
   const files = await fixture();
-  t.after(() => rm(files.root, { recursive: true, force: true }));
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
   const cloudflare = mockCloudflare();
 
   await assert.rejects(
@@ -280,7 +304,7 @@ test("apply fails before mutations when no existing or supplied Worker secret is
 
 test("an incompatible existing Vectorize index is rejected before changes", async (t) => {
   const files = await fixture();
-  t.after(() => rm(files.root, { recursive: true, force: true }));
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
   const cloudflare = mockCloudflare({
     d1: "33333333-3333-3333-3333-333333333333",
     vector: { dimensions: 768, metric: "cosine" },
@@ -301,7 +325,7 @@ test("an incompatible existing Vectorize index is rejected before changes", asyn
 
 test("rerun-safe discovery accepts the 1.x key alias and recovers when create reports a conflict", async (t) => {
   const files = await fixture();
-  t.after(() => rm(files.root, { recursive: true, force: true }));
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
   const cloudflare = mockCloudflare({ d1CreateCode: 1 });
   const lines = [];
   await runSetup(["--apply"], {
@@ -319,7 +343,7 @@ test("rerun-safe discovery accepts the 1.x key alias and recovers when create re
 
 test("a failed secret update never includes the secret value in the error", async (t) => {
   const files = await fixture();
-  t.after(() => rm(files.root, { recursive: true, force: true }));
+  t.after(() => ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(files.root, { allowedRoot: path.resolve(os.tmpdir()), recursive: true, force: true }));
   const cloudflare = mockCloudflare({ secretPutCode: 1 });
   let failure;
   try {

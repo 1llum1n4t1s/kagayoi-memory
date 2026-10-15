@@ -4,6 +4,28 @@ import { truncateUtf16 } from "./unicode-text.mjs";
 const INDEX_VERSION = 1;
 const compact = (value) => typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
 
+// 保存本文は保ち、索引に使う利用者の依頼だけを表示用に投影する。
+export function indexRequestText(value) {
+  return String(value || "")
+    .replace(/<in-app-browser-context\b(?=[^>]*\bsource\s*=\s*["']ambient-ui-state["'])[^>]*>[\s\S]*?<\/in-app-browser-context\s*>/gi, "\n")
+    .replace(/<send_user_message_question_reply\s*>([\s\S]*?)<\/send_user_message_question_reply\s*>/gi, (wrapper, body) => {
+      let replies;
+      try { replies = JSON.parse(body); } catch { return wrapper; }
+      if (!Array.isArray(replies) || !replies.length || !replies.every((reply) => reply &&
+        typeof reply.question === "string" && reply.question.trim() && typeof reply.answer === "string")) return wrapper;
+      // 長い質問でも、利用者が実際に選んだ回答を索引の先頭に残す。
+      return replies.map((reply) => `回答: ${compact(reply.answer)}（質問: ${compact(reply.question)}）`).join(" / ");
+    });
+}
+
+function degradedIndexRequest(value) {
+  const text = compact(value);
+  return /^This block is automatically supplied ambient UI state\b/i.test(text) ||
+    /<in-app-browser-context\b[^>]*\bsource\s*=\s*["']ambient-ui-state["']/i.test(text) ||
+    /^<send_user_message_question_reply\b/i.test(text) ||
+    (/^\[\s*\{/.test(text) && /"questionItemId"\s*:/.test(text) && /request_user_input_async/.test(text));
+}
+
 export function matchingTopicTerms(text, terms) {
   const normalize = (value) => value.normalize("NFKC").toLowerCase().replace(/[._-]+/gu, " ");
   const topic = normalize(text);
@@ -57,7 +79,7 @@ export function validDate(value) {
 
 export function buildMemoryIndex({ title, request, response, sourceUpdatedAt, sourceKind = "conversation" } = {}) {
   const taskTitle = shortText(title, 100);
-  const requestLine = firstText(String(request || "").split("### Current user request\n").at(-1));
+  const requestLine = firstText(indexRequestText(request).split("### Current user request\n").at(-1));
   const sections = [...new Set(String(response || "").split(/\r?\n/)
     .filter((line) => /^#{1,4}\s+/.test(line)).map(plainLine).filter(Boolean))].slice(0, 4).map((line) => shortText(line, 60));
   const briefFollowup = /^(?:はい|いいえ|了解(?:です|しました)?|承知しました|ありがとう(?:ございます)?|お疲れ(?:様|さま)(?:です|でした)?|[Oo][Kk]|続けて|お願いします|よろしく(?:お願いします)?)[。！!\s]*$/.test(requestLine);
@@ -102,7 +124,7 @@ export function documentIndex(document, fallbackContainer, terms = []) {
   const saved = metadata.memoryIndex?.version === INDEX_VERSION ? metadata.memoryIndex : null;
   const index = saved ? buildMemoryIndex({
     title: saved.title,
-    request: saved.description,
+    request: degradedIndexRequest(saved.description) ? indexRequestText(request).trim() || saved.title : saved.description,
     response: "",
     sourceUpdatedAt: saved.sourceUpdatedAt,
     sourceKind: saved.sourceKind,

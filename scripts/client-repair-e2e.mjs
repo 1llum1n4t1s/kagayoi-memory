@@ -1,7 +1,31 @@
+import * as cleanupFs from "node:fs";
+import * as cleanupPath from "node:path";
+
+// 許可rootの境界とリンクを検査してから標準APIへ渡す。
+function assertCleanupPath(target, allowedRoot) {
+  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
+  const resolved = cleanupPath.resolve(target);
+  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
+  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
+  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
+    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (cleanupPath.dirname(current) === current) break;
+  }
+  const pending = [resolved];
+  while (pending.length) {
+    const current = pending.pop();
+    let stat;
+    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
+    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
+  }
+  return resolved;
+}
 // 失敗条件を先に固定する: 短い設定キー漏れ、UTF-16境界破壊、旧ID変化、本文欠落、
 // 旧receipt/旧canonical再送、履歴stream全件同時生成、重複候補/sort/limitの変化、検索query破壊。
 // 実CLIと実hookだけをauthenticated loopback APIへ接続し、架空のfixtureだけを保存する。
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -167,8 +191,7 @@ try {
 finally {
   await new Promise((done) => server.close(done));
   if (process.platform === "win32") {
-    const literal = home.replaceAll("'", "''"), temporaryRoot = resolve(tmpdir()).replaceAll("'", "''");
-    execFileSync("pwsh", ["-NoProfile", "-Command", `$taskPath='${literal}'; $taskRoot='${temporaryRoot}'; $item=Get-Item -LiteralPath $taskPath; if ($item.Parent.FullName -ne $taskRoot -or $item.Name -notlike 'kagayoi-client-repair-e2e-*' -or $item.LinkType) { throw 'Unexpected cleanup target' }; Remove-Item -LiteralPath $item.FullName -Recurse -Force; if (Test-Path -LiteralPath $taskPath) { throw 'Temporary fixture remains' }`]);
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(home, { allowedRoot: resolve(tmpdir()), recursive: true });
   } else { if (dirname(home) !== resolve(tmpdir()) || (await lstat(home)).isSymbolicLink()) throw new Error("Unexpected cleanup target"); await rm(home, { recursive: true }); }
   await mkdir(dirname(artifact), { recursive: true });
   await writeFile(artifact, JSON.stringify({ ...report, temporaryFixtureRemoved: true }, null, 2) + "\n");

@@ -1,5 +1,29 @@
+import * as cleanupFs from "node:fs";
+import * as cleanupPath from "node:path";
+
+// 許可rootの境界とリンクを検査してから標準APIへ渡す。
+function assertCleanupPath(target, allowedRoot) {
+  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
+  const resolved = cleanupPath.resolve(target);
+  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
+  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
+  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
+    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (cleanupPath.dirname(current) === current) break;
+  }
+  const pending = [resolved];
+  while (pending.length) {
+    const current = pending.pop();
+    let stat;
+    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
+    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
+  }
+  return resolved;
+}
 import assert from "node:assert/strict";
-import { access, readFile, rm, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { buildPackage, isAllowedPackagePath, REPOSITORY_ROOT } from "./package-plugin.mjs";
@@ -59,7 +83,7 @@ test("buildPackage creates a clean, valid consumer package", async () => {
     const validation = await validatePlugin(output);
     assert.equal(validation.root, output);
   } finally {
-    await rm(output, { recursive: true, force: true });
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(output, { allowedRoot: path.join(REPOSITORY_ROOT, "dist"), recursive: true, force: true });
   }
 });
 
@@ -78,6 +102,6 @@ test("validator requires installed-root MCP cwd and rejects machine-specific pat
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
     await assert.rejects(validatePlugin(output), /machine-specific or non-portable path/u);
   } finally {
-    await rm(output, { recursive: true, force: true });
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(output, { allowedRoot: path.join(REPOSITORY_ROOT, "dist"), recursive: true, force: true });
   }
 });

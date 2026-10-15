@@ -1,6 +1,32 @@
+import * as cleanupFs from "node:fs";
+import * as cleanupPath from "node:path";
+
+// 許可rootの境界とリンクを検査してから標準APIへ渡す。
+function assertCleanupPath(target, allowedRoot) {
+  if (typeof target !== 'string' || !target || typeof allowedRoot !== 'string' || !allowedRoot || !cleanupPath.isAbsolute(target) || !cleanupPath.isAbsolute(allowedRoot)) throw new Error('Cleanup paths must be absolute');
+  const resolved = cleanupPath.resolve(target);
+  const relative = cleanupPath.relative(cleanupPath.resolve(allowedRoot), resolved);
+  if (!relative || relative === '..' || relative.startsWith('..' + cleanupPath.sep) || cleanupPath.isAbsolute(relative)) throw new Error('Cleanup target is outside the allowed root');
+  for (let current = resolved; ; current = cleanupPath.dirname(current)) {
+    try { if (cleanupFs.lstatSync(current).isSymbolicLink()) throw new Error('Cleanup path contains a link'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (cleanupPath.dirname(current) === current) break;
+  }
+  const pending = [resolved];
+  while (pending.length) {
+    const current = pending.pop();
+    let stat;
+    try { stat = cleanupFs.lstatSync(current); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (stat.isSymbolicLink()) throw new Error('Cleanup directory contains a link');
+    if (stat.isDirectory()) for (const entry of cleanupFs.readdirSync(current)) pending.push(cleanupPath.join(current, entry));
+  }
+  return resolved;
+}
 // 実hookプロセスとローカルHTTP APIを接続する再現用E2E。秘密・外部APIは使わない。
 import assert from "node:assert/strict";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { documentIndex, formatIndexItem } from "../client/memory-index.mjs";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { appendFile, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -30,7 +56,8 @@ let requests = 0;
 const rows = () => fixtureRows || Array.from({ length: huge ? 5 : 1 }, (_, index) => ({
   id: `doc-${index}`, containerTag: "fixture-space", updatedAt: revision, createdAt: "2026-09-01T00:00:00.000Z",
   topics: huge ? Array.from({ length: 500 }, (_, topic) => `Chrome-${topic}-${"&".repeat(100)}`) : ["Chrome"],
-  metadata: { project: "fixture-project", memoryIndex: { version: 1, title: "Chrome extension history", description: "Chrome extension implementation", sections: [], recallable: true } },
+  searchExcerpt: huge ? "Chrome " + "😀&".repeat(100) : undefined,
+  metadata: { project: huge ? "fixture-project " + "p".repeat(160) : "fixture-project", sm_project_id: huge ? "q".repeat(160) : undefined, memoryIndex: { version: 1, title: huge ? "Chrome " + "t".repeat(100) : "Chrome extension history", description: huge ? "Chrome extension " + "😀&".repeat(1000) : "Chrome extension implementation", sections: huge ? ["s".repeat(60), "u".repeat(60)] : [], recallable: true } },
 }));
 const server = createServer(async (request, response) => {
   if (request.headers.authorization !== `Bearer ${configuredKey}`) {
@@ -38,11 +65,11 @@ const server = createServer(async (request, response) => {
   }
   let body = "";
   for await (const chunk of request) body += chunk;
-  if (body && request.url === "/v4/search") lastSearchQuery = JSON.parse(body).q;
+  if (body && request.url === "/v4/search") { lastSearchQuery = JSON.parse(body).q; }
   requests += 1;
   response.writeHead(failure ? 503 : 200, { "Content-Type": "application/json" });
   response.end(JSON.stringify(failure ? { error: "fixture unavailable" } : {
-    searchScope: "all-containers", searchedContainers: ["fixture-space"], spaceDiscoveryComplete: true,
+    user: { id: "fixture-user" }, searchScope: "all-containers", searchedContainers: ["fixture-space"], spaceDiscoveryComplete: true,
     spaces: [{ containerTag: "fixture-space", memoryCount: 5 }], results: empty ? [] : rows(),
   }));
 });
@@ -78,10 +105,58 @@ try {
   await new Promise((done, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", done); });
   environment.KAGAYOI_MEMORY_API_URL = `http://127.0.0.1:${server.address().port}`;
   await writeFile(transcript, `${JSON.stringify({ type: "session_meta", payload: { id: "fixture-session" } })}\n`);
+  await check("default three and explicit five through launcher and setup", async () => {
+    fixtureRows = Array.from({ length: 5 }, (_, index) => ({ ...rows()[0], id: `small-${index}` }));
+    const input = { ...payload, session_id: undefined };
+    const items = (output) => (output.hookSpecificOutput.additionalContext.match(/\n  id=/gu) || []).length;
+    const defaultItems = items(await hook(input));
+    assert.equal(defaultItems, 3);
+    const configPath = join(temporary, "kagayoi-memory.json");
+    const setup = () => promisify(execFile)("pwsh", ["-NoProfile", "-File", join(runtimeRoot, "scripts", "setup-client.ps1"), "-CodexHome", temporary, "-BaseUrl", environment.KAGAYOI_MEMORY_API_URL, "-Force"], { env: environment, windowsHide: true, timeout: 20_000 });
+    await setup();
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).maxMemories, 3);
+    assert.equal(items(await hook(input)), 3);
+    await writeFile(configPath, JSON.stringify({ maxMemories: 5 }));
+    await setup();
+    assert.equal(JSON.parse(await readFile(configPath, "utf8")).maxMemories, 5);
+    const explicitItems = items(await hook(input));
+    assert.equal(explicitItems, 5);
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(configPath, { allowedRoot: temporary });
+    fixtureRows = null;
+    return { defaultItems, setupDefault: 3, explicitItems, setupPreservesExplicit: 5 };
+  });
   await check("duplicate injection suppression", async () => {
     const after = [count(await hook()), count(await hook())];
     assert.ok(after[0]); assert.equal(after[1], 0);
     return { characters: after };
+  });
+  await check("UI envelopes do not enter automatic search queries", async () => {
+    const input = { ...payload, session_id: undefined };
+    await hook({ ...input, prompt: '<in-app-browser-context source="ambient-ui-state">\nThis block is automatically supplied ambient UI state. unrelated-ui-marker\n</in-app-browser-context>\nChrome extension implementation' });
+    assert.match(lastSearchQuery, /Chrome/u);
+    assert.doesNotMatch(lastSearchQuery, /ambient|unrelated-ui-marker/u);
+    await hook({ ...input, prompt: `<send_user_message_question_reply>${JSON.stringify([{ questionItemId: '["request_user_input_async","call_fixture","0"]', question: "Chrome extension implementation?", answer: "Keep retries bounded" }])}</send_user_message_question_reply>` });
+    assert.match(lastSearchQuery, /Chrome/u);
+    assert.match(lastSearchQuery, /retries/u);
+    assert.doesNotMatch(lastSearchQuery, /questionItemId|request_user_input_async|call_fixture/u);
+  });
+  await check("legacy UI descriptions are projected without extra document fetches", async () => {
+    const original = rows()[0];
+    const broken = '[{"questionItemId":"[\\"request_user_input_async\\",\\"call_fixture';
+    fixtureRows = [
+      { ...original, id: "legacy-with-source", content: '### User request\n<in-app-browser-context source="ambient-ui-state">This block is automatically supplied ambient UI state.</in-app-browser-context>\nChrome extension implementation\n\n### Final assistant response\nCompleted', metadata: { ...original.metadata, memoryIndex: { ...original.metadata.memoryIndex, description: "This block is automatically supplied ambient UI state, not part of the user's request." } } },
+      { ...original, id: "legacy-index-only", metadata: { ...original.metadata, memoryIndex: { ...original.metadata.memoryIndex, description: broken } } },
+      { ...original, id: "legacy-opt-out", metadata: { ...original.metadata, memoryIndex: { ...original.metadata.memoryIndex, description: broken, recallable: false } } },
+    ];
+    try {
+      const before = requests;
+      const output = (await hook({ ...payload, session_id: "legacy-ui-session" })).hookSpecificOutput.additionalContext;
+      assert.match(output, /id=legacy-with-source/u);
+      assert.match(output, /id=legacy-index-only/u);
+      assert.doesNotMatch(output, /id=legacy-opt-out|questionItemId|request_user_input_async|ambient UI state/u);
+      assert.equal(requests - before, 1);
+      return { requests: requests - before, detailsFetched: 0 };
+    } finally { fixtureRows = null; }
   });
   await check("document update date", async () => {
     revision = "2026-09-30T01:00:00.000Z";
@@ -194,12 +269,12 @@ try {
     await writeFile(stateFile, "broken fixture");
     assert.ok(count(await hook()));
     assert.ok(count(await hook({ ...payload, transcript_path: join(temporary, "missing.jsonl") })));
-    await rm(stateFile);
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(stateFile, { allowedRoot: temporary });
   });
   await check("unwritable state path fail open", async () => {
-    await rm(stateDirectory, { recursive: true }); await writeFile(stateDirectory, "fixture file blocks directory");
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(stateDirectory, { allowedRoot: temporary, recursive: true }); await writeFile(stateDirectory, "fixture file blocks directory");
     assert.ok(count(await hook())); assert.ok(count(await hook()));
-    await rm(stateDirectory);
+    await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(stateDirectory, { allowedRoot: temporary });
   });
   await check("API failure remains visible and does not mark seen", async () => {
     failure = true; assert.ok((await hook()).systemMessage); failure = false;
@@ -221,12 +296,37 @@ try {
   await check("topic count and escaped output size bound", async () => {
     huge = true;
     const input = { ...payload, session_id: "large-session" };
+    const formattedLengths = rows().slice(0, 3).map((row) => formatIndexItem(documentIndex(row)).length);
+    assert.ok(formattedLengths.reduce((sum, size) => sum + size, 0) > 3000);
     const output = await hook(input);
     const text = output.hookSpecificOutput.additionalContext;
-    assert.ok(text.length <= 6000);
+    assert.ok(text.length <= 3000);
     assert.match(text, /id=doc-0/); assert.match(text, /container=fixture-space/); assert.match(text, /provenance=fixture-project/); assert.match(text, /2026-09-30/);
     assert.doesNotMatch(text, /Chrome-3-/);
-    return { characters: text.length, maximumCharacters: 6000, fixtureTopicCharacters: rows()[0].topics.join("").length };
+    const firstIds = [...text.matchAll(/\n  id=(doc-\d+)/gu)].map((match) => match[1]);
+    assert.ok(firstIds.length > 0 && firstIds.length < 3);
+    const next = (await hook(input)).hookSpecificOutput.additionalContext;
+    const nextIds = [...next.matchAll(/\n  id=(doc-\d+)/gu)].map((match) => match[1]);
+    assert.ok(nextIds.length);
+    assert.ok(nextIds.every((id) => !firstIds.includes(id)));
+    assert.ok(next.length <= 3000);
+    return { characters: text.length, nextCharacters: next.length, firstIds, nextIds, formattedLengths, maximumCharacters: 3000, fixtureTopicCharacters: rows()[0].topics.join("").length };
+  });
+  await check("oversized middle index does not hide a later fitting index", async () => {
+    const large = rows().slice(0, 3);
+    fixtureRows = [large[0], large[1], { ...large[2], topics: ["Chrome"], searchExcerpt: undefined,
+      metadata: { ...large[2].metadata, project: "fixture-project", sm_project_id: undefined,
+        memoryIndex: { ...large[2].metadata.memoryIndex, description: "Chrome extension", sections: [] } } }];
+    try {
+      const input = { ...payload, prompt: "Chrome extension", session_id: "fit-later-session" };
+      const text = (await hook(input)).hookSpecificOutput.additionalContext;
+      assert.match(text, /id=doc-0/u); assert.match(text, /id=doc-2/u); assert.doesNotMatch(text, /id=doc-1/u);
+      assert.ok(text.length <= 3000);
+      const next = (await hook(input)).hookSpecificOutput.additionalContext;
+      assert.match(next, /id=doc-1/u); assert.doesNotMatch(next, /id=doc-(?:0|2)/u);
+      assert.equal(count(await hook(input)), 0);
+      return { firstIds: ["doc-0", "doc-2"], nextIds: ["doc-1"], characters: text.length, maximumCharacters: 3000 };
+    } finally { fixtureRows = null; }
   });
   await check("large transcript gap resets safely and next prompt deduplicates", async () => {
     huge = false;
@@ -244,18 +344,7 @@ try {
   await new Promise((done) => server.close(done));
   // mkdtempが今回作った専用ディレクトリだけを清掃する。
   assert.ok(temporary.startsWith(join(tmpdir(), "kagayoi-recall-e2e-")));
-  if (process.platform === "win32") execFileSync("pwsh", ["-NoProfile", "-Command", `
-    $target = [IO.Path]::GetFullPath($env:KAGAYOI_RECALL_E2E_TEMP)
-    $base = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-    if (-not $target.StartsWith($base, [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($target) -notmatch '^kagayoi-recall-e2e-[A-Za-z0-9]{6}$') { throw 'Unexpected temporary target' }
-    $resolved = (Resolve-Path -LiteralPath $target -ErrorAction Stop).Path
-    if ($resolved -ne $target) { throw 'Temporary target changed' }
-    $items = @((Get-Item -LiteralPath $resolved -Force)) + @(Get-ChildItem -LiteralPath $resolved -Recurse -Force)
-    if ($items | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) { throw 'Linked temporary item' }
-    if (Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($resolved) }) { throw 'Temporary target is still in use' }
-    Remove-Item -LiteralPath $resolved -Recurse -ErrorAction Stop
-    if (Test-Path -LiteralPath $resolved) { throw 'Temporary target remains' }
-  `], { env: { ...process.env, KAGAYOI_RECALL_E2E_TEMP: temporary }, windowsHide: true, stdio: "pipe" });
+  if (process.platform === "win32") await ((target, { allowedRoot, ...options }) => cleanupFs.promises.rm(assertCleanupPath(target, allowedRoot), options))(temporary, { allowedRoot: resolve(tmpdir()), recursive: true });
   else {
     assert.equal(dirname(temporary), resolve(tmpdir()));
     async function verify(path) {

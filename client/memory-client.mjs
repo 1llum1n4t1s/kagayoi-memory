@@ -30,7 +30,7 @@ export function readSettings(codexHome = process.env.CODEX_HOME || join(homedir(
   return {
     codexHome,
     recallMode: config.recallMode || "direct",
-    maxMemories: Math.max(1, Math.min(5, Number(config.maxMemories) || 5)),
+    maxMemories: Math.max(1, Math.min(5, Number(config.maxMemories) || 3)),
     minimumSimilarity: Math.max(0.65, Math.min(0.95, Number(config.similarityThreshold) || 0.70)),
     projectContainerTag: config.projectContainerTag,
     userContainerTag: config.userContainerTag,
